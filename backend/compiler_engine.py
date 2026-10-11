@@ -1,0 +1,569 @@
+import difflib
+import re
+import os
+import subprocess
+import tempfile
+import shutil
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Tuple, Any
+
+KEYWORDS = {
+    "int", "float", "char", "double", "void", "return", "if", "else", "while", "for",
+    "using", "namespace", "cout", "cin", "endl", "std", "include", "string", "bool", "true", "false",
+    "printf", "scanf", "puts"
+}
+
+TOKEN_PATTERN = re.compile(
+    r"(?P<SPACE>[ \t]+)|(?P<PREPROCESSOR>\#[^\n]*)|(?P<COMMENT>//[^\n]*)|"
+    r"(?P<FLOAT>\d+\.\d+)|(?P<NUMBER>\d+)|"
+    r"(?P<STRING>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')|"
+    r"(?P<ID>[A-Za-z_]\w*)|(?P<OP><<|>>|<=|>=|==|!=|\+\+|--|[+\-*/%=<>])|"
+    r"(?P<DELIM>[(){};,])|(?P<INVALID>.)"
+)
+
+DECLARATION = re.compile(
+    r"^(int|float|double|char|string|bool)\s+([A-Za-z_]\w*)(?:\s*=\s*(.+))?$"
+)
+ASSIGNMENT = re.compile(r"^([A-Za-z_]\w*)\s*=\s*(.+)$")
+PRINT = re.compile(r"^print\s*\(\s*(.*?)\s*\)$")
+PRINTF = re.compile(r"^printf\s*\(\s*(.*?)\s*\)$")
+FUNCTION_DEF = re.compile(r"^(int|float|double|char|void|bool|string)\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*(\{)?$")
+CONTROL = re.compile(r"^(if|while)\s*\((.*?)\)$")
+FOR_LOOP = re.compile(r"^for\s*\((.*?);(.*?);(.*?)\)$")
+RETURN = re.compile(r"^return(?:\s+(.+))?$")
+COUT = re.compile(r"^cout\s*<<\s*(.+)$")
+IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*\b")
+
+
+@dataclass
+class Diagnostic:
+    level: str  # ERROR | WARNING | INFO
+    line: int
+    column: int
+    message: str
+    suggestion: str = ""
+    replacement: Optional[str] = None
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class Token:
+    line: int
+    column: int
+    type: str
+    lexeme: str
+
+    def to_dict(self):
+        return asdict(self)
+
+
+class CompilerAnalyzer:
+    def __init__(self, source: str, language: str = "cpp"):
+        self.source = source
+        self.language = language
+        self.tokens: List[Token] = []
+        self.symbols: Dict[str, Dict[str, Any]] = {}
+        self.diagnostics: List[Diagnostic] = []
+        self.optimizations: List[str] = []
+        self.corrected_lines: List[str] = []
+        self.assignments: Dict[str, List[int]] = {}
+        self.usages: Dict[str, List[int]] = {}
+        self.functions: Dict[str, Dict[str, Any]] = {}
+        self.known_constants: Dict[str, str] = {}
+        self.expression_cache: Dict[str, Tuple[str, int]] = {}
+        self.auto_declarations: Dict[str, int] = {}
+
+    def add(self, level: str, line: int, column: int, message: str, suggestion: str = "", replacement: Optional[str] = None):
+        self.diagnostics.append(Diagnostic(level, line, column, message, suggestion, replacement))
+
+    def lex(self):
+        for line_no, line in enumerate(self.source.splitlines(), 1):
+            position = 0
+            while position < len(line):
+                match = TOKEN_PATTERN.match(line, position)
+                if not match:
+                    break
+                kind, value = match.lastgroup, match.group()
+                start_col = position + 1
+                position = match.end()
+
+                if kind in {"SPACE", "COMMENT", "PREPROCESSOR"}:
+                    if kind in {"COMMENT", "PREPROCESSOR"}:
+                        break
+                    continue
+
+                if kind == "ID":
+                    kind = "KEYWORD" if value in KEYWORDS else "IDENTIFIER"
+                elif kind == "DELIM":
+                    kind = "DELIMITER"
+                elif kind == "OP":
+                    kind = "OPERATOR"
+                elif kind == "INVALID":
+                    self.add("ERROR", line_no, start_col, f"Invalid character '{value}'.", f"Remove invalid character '{value}'")
+
+                self.tokens.append(Token(line=line_no, column=start_col, type=kind, lexeme=value))
+
+    @staticmethod
+    def identifiers(expression: str) -> List[str]:
+        # Strip string and character literals
+        cleaned = re.sub(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'", "", expression)
+        return [x for x in IDENTIFIER.findall(cleaned) if x not in KEYWORDS]
+
+    def check_expression(self, expression: str, line_no: int, col_offset: int = 1):
+        called_functions = re.findall(r"\b([A-Za-z_]\w*)\s*\(", expression)
+        for function_name in called_functions:
+            if function_name in {"print", "printf", "scanf", "cin", "cout"}:
+                continue
+            if function_name not in self.functions:
+                choices = difflib.get_close_matches(function_name, self.functions.keys(), n=1, cutoff=0.60)
+                suggestion = f"Did you mean function '{choices[0]}'?" if choices else "Declare the function before calling it."
+                replacement = f"{choices[0]}(" if choices else None
+                self.add("ERROR", line_no, col_offset, f"Function '{function_name}' is not declared.", suggestion, replacement)
+
+        for name in self.identifiers(expression):
+            if name in called_functions:
+                continue
+            if name not in self.symbols:
+                choices = difflib.get_close_matches(name, self.symbols.keys(), n=1, cutoff=0.60)
+                suggestion = ""
+                replacement = None
+                if choices:
+                    candidate = choices[0]
+                    corrected = re.sub(rf"\b{re.escape(name)}\b", candidate, expression)
+                    suggestion = f"Did you mean '{candidate}'? Suggested correction: {corrected}"
+                    replacement = candidate
+                    self.usages.setdefault(candidate, []).append(line_no)
+                else:
+                    self.auto_declarations.setdefault(name, line_no)
+                    suggestion = f"Corrected Code adds: int {name} = 0; before this statement."
+                self.add("ERROR", line_no, col_offset, f"'{name}' is not declared.", suggestion, replacement)
+            else:
+                self.usages.setdefault(name, []).append(line_no)
+
+    def register_function(self, line_no: int, return_type: str, name: str, parameters: str):
+        if name in self.functions:
+            self.add("ERROR", line_no, 1, f"Duplicate definition of function '{name}'.", f"Rename or remove duplicate function '{name}'")
+            return
+        self.functions[name] = {"line": line_no, "return_type": return_type, "params": parameters}
+        if not parameters.strip() or parameters.strip() == "void":
+            return
+        for parameter in parameters.split(","):
+            match = re.fullmatch(r"\s*(int|float|char|string|bool)\s+([A-Za-z_]\w*)\s*", parameter)
+            if not match:
+                self.add("ERROR", line_no, 1, f"Invalid parameter declaration '{parameter.strip()}'.", "Provide a valid type and identifier.")
+                continue
+            data_type, parameter_name = match.groups()
+            if parameter_name not in self.symbols:
+                self.symbols[parameter_name] = {"type": data_type, "value": "parameter", "line": line_no}
+                self.assignments.setdefault(parameter_name, []).append(line_no)
+
+    def fold_constants(self, expression: str, line_no: int) -> str:
+        if not re.fullmatch(r"[\d.\s+\-*/%()]+", expression):
+            return expression
+        try:
+            value = eval(expression, {"__builtins__": {}}, {})
+        except (ArithmeticError, SyntaxError, TypeError, ZeroDivisionError):
+            return expression
+        if isinstance(value, (int, float)):
+            folded = str(value)
+            if folded != re.sub(r"\s+", "", expression):
+                self.optimizations.append(
+                    f"Line {line_no}: Constant folding: {expression.strip()} -> {folded}"
+                )
+                return folded
+        return expression
+
+    def optimize_expression(self, expression: str, line_no: int, target: Optional[str] = None) -> str:
+        original = expression.strip()
+        propagated = original
+        for name, value in self.known_constants.items():
+            propagated = re.sub(rf"\b{re.escape(name)}\b", value, propagated)
+        if propagated != original:
+            self.optimizations.append(
+                f"Line {line_no}: Constant propagation: {original} -> {propagated}"
+            )
+
+        simplified = propagated
+        rules = (
+            (r"^0\s*\+\s*(.+)$", r"\1"), (r"^(.+?)\s*\+\s*0$", r"\1"),
+            (r"^(.+?)\s*-\s*0$", r"\1"), (r"^1\s*\*\s*(.+)$", r"\1"),
+            (r"^(.+?)\s*\*\s*1$", r"\1"), (r"^(.+?)\s*/\s*1$", r"\1"),
+            (r"^(.+?)\s*\*\s*0$", "0"), (r"^0\s*\*\s*(.+)$", "0"),
+        )
+        for pattern, replacement in rules:
+            match = re.fullmatch(pattern, simplified)
+            if match:
+                simplified = match.expand(replacement)
+                break
+        if simplified != propagated:
+            self.optimizations.append(
+                f"Line {line_no}: Algebraic simplification: {propagated} -> {simplified}"
+            )
+
+        strength = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*\*\s*2\s*", simplified)
+        if strength:
+            operand = strength.group(1)
+            simplified = f"{operand} + {operand}"
+            self.optimizations.append(
+                f"Line {line_no}: Strength reduction suggestion: {operand} * 2 -> {simplified}"
+            )
+
+        optimized = self.fold_constants(simplified, line_no)
+        normalized = re.sub(r"\s+", "", original)
+        if target and normalized and not re.fullmatch(r"[\d.]+", normalized):
+            previous = self.expression_cache.get(normalized)
+            if previous and previous[0] != target:
+                self.optimizations.append(
+                    f"Line {line_no}: Common subexpression: {original} was already computed in "
+                    f"'{previous[0]}' on line {previous[1]}; reuse it where safe."
+                )
+            self.expression_cache[normalized] = (target, line_no)
+
+        if target and re.fullmatch(r"-?\d+(?:\.\d+)?", optimized.strip()):
+            self.known_constants[target] = optimized.strip()
+        elif target:
+            self.known_constants.pop(target, None)
+            direct_copy = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*", optimized)
+            if direct_copy and direct_copy.group(1) in self.symbols:
+                self.optimizations.append(
+                    f"Line {line_no}: Copy propagation opportunity: '{target}' receives '{direct_copy.group(1)}'; "
+                    "the extra copy can be removed where safe."
+                )
+        return optimized
+
+    def parse(self):
+        for line_no, raw in enumerate(self.source.splitlines(), 1):
+            no_comment = raw.split("//", 1)[0]
+            text = no_comment.strip()
+            if not text:
+                self.corrected_lines.append(raw)
+                continue
+            if text.startswith("#") or text == "using namespace std;" or text in {"{", "}"}:
+                self.corrected_lines.append(raw)
+                continue
+
+            function = FUNCTION_DEF.match(text)
+            control = CONTROL.match(text)
+            for_loop = FOR_LOOP.match(text)
+
+            if function:
+                return_type, name, parameters, _opening_brace = function.groups()
+                self.register_function(line_no, return_type, name, parameters)
+                self.corrected_lines.append(raw)
+                continue
+
+            if control:
+                self.check_expression(control.group(2), line_no)
+                self.corrected_lines.append(raw)
+                continue
+
+            if for_loop:
+                init_part, cond_part, update_part = for_loop.groups()
+                if init_part.strip():
+                    self.check_expression(init_part, line_no)
+                if cond_part.strip():
+                    self.check_expression(cond_part, line_no)
+                if update_part.strip():
+                    self.check_expression(update_part, line_no)
+                self.corrected_lines.append(raw)
+                continue
+
+            has_semicolon = text.endswith(";")
+            statement = text[:-1].strip() if has_semicolon else text
+            corrected_stmt = raw
+
+            if not has_semicolon:
+                likely_statement = bool(DECLARATION.match(statement) or ASSIGNMENT.match(statement)
+                                        or PRINT.match(statement) or PRINTF.match(statement) or COUT.match(statement) or RETURN.match(statement))
+                if likely_statement:
+                    self.add("ERROR", line_no, len(raw) + 1, "Missing ';' at the end of the statement.",
+                             f"Suggested correction: {statement};", f"{statement};")
+                    corrected_stmt = raw.rstrip() + ";"
+                    has_semicolon = True
+                else:
+                    self.add("ERROR", line_no, 1, "Invalid statement syntax.", "Ensure statement has valid syntax and ends with semicolon.")
+                    self.corrected_lines.append(raw)
+                    continue
+
+            # Check if this line has a typo correction for auto-fixing
+            declaration = DECLARATION.match(statement)
+            assignment = ASSIGNMENT.match(statement)
+            printing = PRINT.match(statement)
+            printf = PRINTF.match(statement)
+            returning = RETURN.match(statement)
+            cout = COUT.match(statement)
+
+            if declaration:
+                data_type, name, expression = declaration.groups()
+                if name in self.symbols and self.symbols[name]["value"] != "parameter":
+                    self.add("ERROR", line_no, 1, f"Duplicate declaration of '{name}'.", f"Remove or rename duplicate variable '{name}'.")
+                else:
+                    value = "-"
+                    if expression:
+                        self.check_expression(expression, line_no)
+                        value = self.optimize_expression(expression, line_no, name)
+                    self.symbols[name] = {"type": data_type, "value": value, "line": line_no}
+                    self.assignments.setdefault(name, []).append(line_no)
+                self.corrected_lines.append(corrected_stmt)
+
+            elif assignment:
+                name, expression = assignment.groups()
+                line_to_add = corrected_stmt
+                if name not in self.symbols:
+                    choices = difflib.get_close_matches(name, self.symbols.keys(), n=1, cutoff=0.60)
+                    if choices:
+                        candidate = choices[0]
+                        suggestion = f"Did you mean '{candidate}'?"
+                        self.add("ERROR", line_no, 1, f"'{name}' is not declared.", suggestion, f"{candidate} = {expression};")
+                        # Fix in corrected lines
+                        line_to_add = re.sub(rf"\b{re.escape(name)}\b", candidate, corrected_stmt, count=1)
+                    else:
+                        self.auto_declarations.setdefault(name, line_no)
+                        suggestion = f"Corrected Code adds: int {name} = 0; before this statement."
+                        self.add("ERROR", line_no, 1, f"'{name}' is not declared.", suggestion)
+                else:
+                    self.assignments.setdefault(name, []).append(line_no)
+                    self.symbols[name]["value"] = self.optimize_expression(expression, line_no, name)
+
+                self.check_expression(expression, line_no)
+                # Check if expression had a typo that we can fix in corrected line
+                for bad_var in self.identifiers(expression):
+                    if bad_var not in self.symbols:
+                        choices = difflib.get_close_matches(bad_var, self.symbols.keys(), n=1, cutoff=0.60)
+                        if choices:
+                            line_to_add = re.sub(rf"\b{re.escape(bad_var)}\b", choices[0], line_to_add)
+
+                self.corrected_lines.append(line_to_add)
+
+            elif printing:
+                expression = printing.group(1).strip()
+                suggested_cout = f"cout << {expression} << endl;" if expression else 'cout << "" << endl;'
+                self.add(
+                    "ERROR",
+                    line_no,
+                    1,
+                    f"'print()' is not standard C/C++. Use 'cout << {expression} << endl;' or 'printf(...)'.",
+                    f"Replace with: {suggested_cout}",
+                    suggested_cout
+                )
+                self.corrected_lines.append(suggested_cout)
+
+            elif printf:
+                arg_expr = printf.group(1).strip()
+                self.check_expression(arg_expr, line_no)
+                self.corrected_lines.append(corrected_stmt)
+
+            elif cout:
+                expression = cout.group(1).strip()
+                self.check_expression(expression, line_no)
+                self.corrected_lines.append(corrected_stmt)
+
+            elif returning:
+                expression = returning.group(1)
+                if expression:
+                    self.check_expression(expression, line_no)
+                self.corrected_lines.append(corrected_stmt)
+
+            else:
+                self.add("ERROR", line_no, 1, "Unsupported C/C++ statement. Use variable declarations, assignments, functions, printf(), or cout <<.", "Check statement syntax.")
+                self.corrected_lines.append(corrected_stmt)
+
+        # Post-analysis checks for unused variables & dead stores
+        for name, info in self.symbols.items():
+            used = self.usages.get(name, [])
+            assignments = self.assignments.get(name, [])
+            if not used and info["value"] != "parameter":
+                self.add("WARNING", info["line"], 1, f"'{name}' is declared but never used (dead-code candidate).", f"Consider removing unused variable '{name}'.")
+            elif len(assignments) > 1 and not any(assignments[i] < u < assignments[i + 1]
+                                                for i in range(len(assignments) - 1) for u in used):
+                self.add("WARNING", assignments[0], 1, f"Earlier assignment to '{name}' is overwritten before use.", f"Check if initial value of '{name}' is redundant.")
+
+        # Auto declarations insertion for un-fixable missing variables
+        for name, line_no in sorted(self.auto_declarations.items(), key=lambda item: item[1], reverse=True):
+            insert_idx = max(0, line_no - 1)
+            self.corrected_lines.insert(
+                insert_idx,
+                f"    int {name} = 0; // Auto-declared fix"
+            )
+
+    def analyze(self):
+        self.lex()
+        self.parse()
+        return self
+
+    def execute_code(self) -> Dict[str, Any]:
+        """
+        Execute the code and return stdout, stderr, execution status and time.
+        First tries native GCC/G++ compilation if available;
+        If snippet doesn't have main() or header, wraps automatically or runs through interpreter.
+        """
+        # If there are syntax/semantic errors, report execution blocked
+        errors = [d for d in self.diagnostics if d.level == "ERROR"]
+        if errors:
+            err_summary = "\n".join([f"Line {e.line}: {e.message}" for e in errors])
+            return {
+                "success": False,
+                "output": "",
+                "error": f"Build halted: {len(errors)} error(s) detected.\n{err_summary}",
+                "execution_type": "static_check"
+            }
+
+        # Locate g++ compiler on system
+        gxx_path = shutil.which("g++")
+        if not gxx_path:
+            for candidate in [
+                r"C:\msys64\ucrt64\bin\g++.exe",
+                r"C:\MinGW\bin\g++.exe",
+                r"C:\msys64\mingw64\bin\g++.exe",
+                "/usr/bin/g++"
+            ]:
+                if os.path.exists(candidate):
+                    gxx_path = candidate
+                    break
+
+        # Prepare executable code snippet
+        raw_code = self.source
+        executable_code = raw_code
+
+        has_main = bool(re.search(r"\b(int|void)\s+main\s*\(", executable_code))
+        has_include = "#include" in executable_code
+        has_namespace = "using namespace std;" in executable_code
+
+        full_cpp = []
+        if not has_include:
+            full_cpp.append("#include <iostream>")
+            full_cpp.append("#include <cstdio>")
+        if not has_namespace:
+            full_cpp.append("using namespace std;")
+
+        if not has_main:
+            # Wrap standalone top-level statements inside main()
+            full_cpp.append("int main() {")
+            for line in executable_code.splitlines():
+                full_cpp.append("    " + line)
+            full_cpp.append("    return 0;")
+            full_cpp.append("}")
+        else:
+            full_cpp.append(executable_code)
+
+        final_source = "\n".join(full_cpp)
+
+        # 1. Try native compilation if g++ is present
+        if gxx_path:
+            temp_dir = tempfile.mkdtemp(prefix="smart_compiler_")
+            src_file = os.path.join(temp_dir, "program.cpp")
+            exe_file = os.path.join(temp_dir, "program.exe" if os.name == "nt" else "program.out")
+
+            try:
+                with open(src_file, "w", encoding="utf-8") as f:
+                    f.write(final_source)
+
+                # Compile
+                compile_proc = subprocess.run(
+                    [gxx_path, "-O2", src_file, "-o", exe_file],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=5
+                )
+
+                if compile_proc.returncode != 0:
+                    return {
+                        "success": False,
+                        "output": "",
+                        "error": compile_proc.stderr,
+                        "execution_type": "native_g++"
+                    }
+
+                # Run executable
+                run_proc = subprocess.run(
+                    [exe_file],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=4
+                )
+
+                return {
+                    "success": run_proc.returncode == 0,
+                    "output": run_proc.stdout if run_proc.stdout else "(Program exited successfully with code 0)",
+                    "error": run_proc.stderr,
+                    "execution_type": "native_g++"
+                }
+            except subprocess.TimeoutExpired:
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": "Execution timed out (infinite loop or process exceeded 4 seconds limit).",
+                    "execution_type": "native_g++"
+                }
+            except Exception as e:
+                # Fallback to simulated execution if error occurs
+                pass
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        # 2. Built-in interpreter simulation (works anywhere even without g++)
+        simulated_output = []
+        for line in raw_code.splitlines():
+            # Check print(expr) or cout << expr
+            m_print = re.search(r"\bprint\s*\(\s*(.*?)\s*\)", line)
+            m_cout = re.search(r"\bcout\s*<<\s*(.*?)(?:<<\s*endl)?\s*;", line)
+            expr = None
+            if m_print:
+                expr = m_print.group(1).strip()
+            elif m_cout:
+                expr = m_cout.group(1).strip()
+
+            if expr:
+                # Substitute known symbols
+                val_expr = expr
+                for s_name, s_info in self.symbols.items():
+                    val = str(s_info.get("value", ""))
+                    if val and val != "-":
+                        val_expr = re.sub(rf"\b{re.escape(s_name)}\b", val, val_expr)
+                try:
+                    res = eval(val_expr, {"__builtins__": {}}, {})
+                    simulated_output.append(str(res))
+                except Exception:
+                    # If string literal or variable
+                    if expr in self.symbols:
+                        simulated_output.append(str(self.symbols[expr]["value"]))
+                    else:
+                        simulated_output.append(expr.strip('"').strip("'"))
+
+        return {
+            "success": True,
+            "output": "\n".join(simulated_output) if simulated_output else "(Program analyzed and completed successfully)",
+            "error": "",
+            "execution_type": "fast_interpreter"
+        }
+
+    def get_results(self) -> Dict[str, Any]:
+        errors = sum(1 for d in self.diagnostics if d.level == "ERROR")
+        warnings = sum(1 for d in self.diagnostics if d.level == "WARNING")
+        
+        # Execute program
+        execution_res = self.execute_code()
+
+        return {
+            "tokens": [t.to_dict() for t in self.tokens],
+            "symbols": [
+                {"name": name, "type": info["type"], "value": info["value"], "line": info["line"]}
+                for name, info in self.symbols.items()
+            ],
+            "diagnostics": [d.to_dict() for d in self.diagnostics],
+            "optimizations": self.optimizations,
+            "corrected_code": "\n".join(self.corrected_lines),
+            "execution": execution_res,
+            "summary": {
+                "token_count": len(self.tokens),
+                "symbol_count": len(self.symbols),
+                "errors": errors,
+                "warnings": warnings,
+                "optimization_count": len(self.optimizations),
+                "status": "Analysis completed with diagnostics." if errors else "Analysis completed successfully."
+            }
+        }
