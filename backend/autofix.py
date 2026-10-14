@@ -662,8 +662,11 @@ class AutoFixer:
         if re.search(r"\b(if|while)\s*\(", masked):
             line = apply_masked_sub(line, r"=!(?!=)", "!=")
         # 'hello' (several chars in single quotes) -> "hello"
-        line = re.sub(r"'((?:[^'\\\n]|\\.){2,})'", lambda m: m.group(0) if re.fullmatch(r"\\.", m.group(1)) else f'"{m.group(1)}"', line) \
-            if re.search(r"'(?:[^'\\\n]|\\.){2,}'", line) and '"' not in line else line
+        code_part, comment_part = code_and_comment(line)
+        if re.search(r"'(?:[^'\\\n]|\\.){2,}'", code_part) and '"' not in code_part:
+            code_part = re.sub(r"'((?:[^'\\\n]|\\.){2,})'",
+                               lambda m: m.group(0) if re.fullmatch(r"\\.", m.group(1)) else f'"{m.group(1)}"', code_part)
+            line = code_part + comment_part
         # cin >> a, b;  ->  cin >> a >> b;     cout << a, b;  ->  cout << a << b;
         for stream, op in (("cin", ">>"), ("cout", "<<")):
             m = re.match(rf"^(\s*(?:std::)?{stream}\s*{op}\s*)(.*?)(;?\s*)$", split_code(line)[0])

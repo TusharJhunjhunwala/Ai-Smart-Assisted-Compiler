@@ -19,7 +19,7 @@ export const App: React.FC = () => {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [code, setCode] = useState<string>('');
   const [examples, setExamples] = useState<ExampleProgram[]>([]);
-  const [selectedExampleId, setSelectedExampleId] = useState<string>('errors_and_opt');
+  const [selectedExampleId, setSelectedExampleId] = useState<string>('tour_clean_program');
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
   const [analysisData, setAnalysisData] = useState<AnalysisResponse | null>(null);
   // The exact source the last analysis was run on (lets Fix All open instantly)
@@ -61,7 +61,7 @@ export const App: React.FC = () => {
     api.getExamples()
       .then((exs) => {
         setExamples(exs);
-        const defaultEx = exs.find((e) => e.id === 'errors_and_opt') || exs[0];
+        const defaultEx = exs.find((e) => e.id === 'tour_clean_program') || exs[0];
         if (defaultEx) {
           setCode(defaultEx.code);
           setSelectedExampleId(defaultEx.id);

@@ -95,8 +95,11 @@ class CompilerAnalyzer:
         self.expression_cache: Dict[str, Tuple[str, int]] = {}
         self.auto_declarations: Dict[str, int] = {}
         self.toplevel_statements: List[Tuple[int, str]] = []
+        self.loop_variant: set = set()  # variables assigned inside a loop body
 
     def add(self, level: str, line: int, column: int, message: str, suggestion: str = "", replacement: Optional[str] = None):
+        if any(d.level == level and d.line == line and d.message == message for d in self.diagnostics):
+            return
         self.diagnostics.append(Diagnostic(level, line, column, message, suggestion, replacement))
 
     def lex(self):
@@ -171,7 +174,9 @@ class CompilerAnalyzer:
         if not parameters.strip() or parameters.strip() == "void":
             return
         for parameter in parameters.split(","):
-            match = re.fullmatch(r"\s*(int|float|char|string|bool)\s+([A-Za-z_]\w*)\s*", parameter)
+            match = re.fullmatch(r"\s*(?:const\s+)?(?:unsigned\s+|signed\s+|long\s+|short\s+)*"
+                                 r"(int|float|double|char|string|bool|long|short|std::string)\s*[&*]?\s*([A-Za-z_]\w*)\s*(?:\[\s*\d*\s*\])?\s*",
+                                 parameter)
             if not match:
                 self.add("ERROR", line_no, 1, f"Invalid parameter declaration '{parameter.strip()}'.", "Provide a valid type and identifier.")
                 continue
@@ -200,6 +205,8 @@ class CompilerAnalyzer:
         original = expression.strip()
         propagated = original
         for name, value in self.known_constants.items():
+            if name in self.loop_variant:
+                continue
             propagated = re.sub(rf"\b{re.escape(name)}\b", value, propagated)
         if propagated != original:
             self.optimizations.append(
@@ -242,7 +249,7 @@ class CompilerAnalyzer:
                 )
             self.expression_cache[normalized] = (target, line_no)
 
-        if target and re.fullmatch(r"-?\d+(?:\.\d+)?", optimized.strip()):
+        if target and target not in self.loop_variant and re.fullmatch(r"-?\d+(?:\.\d+)?", optimized.strip()):
             self.known_constants[target] = optimized.strip()
         elif target:
             self.known_constants.pop(target, None)
@@ -254,10 +261,34 @@ class CompilerAnalyzer:
                 )
         return optimized
 
+    def _mark_loop_variables(self, source_lines: List[str]):
+        """Variables assigned inside a loop change every pass: never treat them as constants."""
+        masked = [split_code(l)[0] for l in source_lines]
+        for i, m in enumerate(masked):
+            if not re.search(r"\b(for|while|do)\b", m):
+                continue
+            depth, started = 0, False
+            for k in range(i, len(masked)):
+                for ch in masked[k]:
+                    if ch == "{":
+                        depth += 1
+                        started = True
+                    elif ch == "}":
+                        depth -= 1
+                for name in re.findall(r"\b([A-Za-z_]\w*)\s*(?:[+\-*/%]?=(?!=)|\+\+|--)", masked[k]):
+                    self.loop_variant.add(name)
+                for name in re.findall(r"(?:\+\+|--)\s*([A-Za-z_]\w*)", masked[k]):
+                    self.loop_variant.add(name)
+                if (started and depth <= 0) or (not started and k > i and masked[k].strip().endswith(";")):
+                    break
+                if not started and k == i and masked[k].rstrip().endswith(";") and not re.match(r"\s*do\b", masked[k]):
+                    break
+
     def parse(self):
         depth = 0
         in_block = False
         source_lines = self.source.splitlines()
+        self._mark_loop_variables(source_lines)
         for line_no, raw in enumerate(source_lines, 1):
             masked, _comment, in_block_after, _ = split_code(raw, in_block)
             # real code with comments removed (block-comment text blanked out)
@@ -461,7 +492,7 @@ class CompilerAnalyzer:
             assignments = self.assignments.get(name, [])
             if not used and info["value"] != "parameter":
                 self.add("WARNING", info["line"], 1, f"'{name}' is declared but never used (dead-code candidate).", f"Consider removing unused variable '{name}'.")
-            elif len(assignments) > 1 and not any(assignments[i] < u < assignments[i + 1]
+            elif len(assignments) > 1 and name not in self.loop_variant and not any(assignments[i] < u <= assignments[i + 1]
                                                 for i in range(len(assignments) - 1) for u in used):
                 self.add("WARNING", assignments[0], 1, f"Earlier assignment to '{name}' is overwritten before use.", f"Check if initial value of '{name}' is redundant.")
 
@@ -483,7 +514,7 @@ class CompilerAnalyzer:
     @staticmethod
     def _is_executable_statement(text: str) -> bool:
         """True for lines that must live inside a function body (cout, assignments, loops, return...)."""
-        if not text or text.startswith("#") or text.startswith("using ") or text.startswith("namespace "):
+        if not text or text.startswith("#") or re.match(r"(?i)(using|namespace)\s", text):
             return False
         if set(text) <= {"{", "}", ";", " "}:
             return False
@@ -679,7 +710,9 @@ class CompilerAnalyzer:
         errors = []
         for d in diags:
             line = d["line"] - offset
-            if d["kind"] == "warning" and re.search(FIXABLE_WARNINGS, d["message"]) and 1 <= line <= len(lines):
+            has_errors = any(x["kind"] in {"error", "fatal error"} for x in diags)
+            if d["kind"] == "warning" and not has_errors and re.search(FIXABLE_WARNINGS, d["message"]) \
+                    and 1 <= line <= len(lines):
                 self.add("WARNING", line, d["column"], d["message"], "Click 'Fix All Errors' or 'Apply Fix' to repair it.")
                 self.diagnostics[-1].source = "compiler"
             if d["kind"] not in {"error", "fatal error"}:

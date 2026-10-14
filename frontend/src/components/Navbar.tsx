@@ -71,10 +71,10 @@ export const Navbar: React.FC<NavbarProps> = ({
           <select
             value={selectedExample}
             onChange={(e) => onSelectExample(e.target.value)}
-            className="bg-transparent text-slate-200 focus:outline-none cursor-pointer max-w-[170px] truncate"
+            className="bg-transparent text-slate-200 focus:outline-none cursor-pointer max-w-[230px] truncate"
           >
             {examples.map((ex) => (
-              <option key={ex.id} value={ex.id} className="bg-slate-900 text-slate-200">
+              <option key={ex.id} value={ex.id} title={ex.description} className="bg-slate-900 text-slate-200">
                 {ex.title}
               </option>
             ))}
