@@ -7,6 +7,8 @@ import shutil
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple, Any
 
+from autofix import AutoFixer, split_code
+
 KEYWORDS = {
     "int", "float", "char", "double", "void", "return", "if", "else", "while", "for",
     "using", "namespace", "cout", "cin", "endl", "std", "include", "string", "bool", "true", "false",
@@ -17,7 +19,7 @@ TOKEN_PATTERN = re.compile(
     r"(?P<SPACE>[ \t]+)|(?P<PREPROCESSOR>\#[^\n]*)|(?P<COMMENT>//[^\n]*)|"
     r"(?P<FLOAT>\d+\.\d+)|(?P<NUMBER>\d+)|"
     r"(?P<STRING>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')|"
-    r"(?P<ID>[A-Za-z_]\w*)|(?P<OP>::|<<|>>|<=|>=|==|!=|\+\+|--|[+\-*/%=<>])|"
+    r"(?P<ID>[A-Za-z_]\w*)|(?P<OP>::|->|<<|>>|<=|>=|==|!=|&&|\|\||\+\+|--|[+\-*/%=<>.&|!?:~^\[\]])|"
     r"(?P<DELIM>[(){};,])|(?P<INVALID>.)"
 )
 
@@ -35,7 +37,7 @@ COUT = re.compile(r"^(?:std\s*::\s*)?cout\s*<<\s*(.+)$")
 IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*\b")
 STRING_LITERAL = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'")
 MAIN_DEF = re.compile(r"\b(?:int|void)\s+main\s*\(")
-IOSTREAM_INCLUDE = re.compile(r"^\s*#\s*include\s*<\s*(?:iostream|bits/stdc\+\+\.h)\s*>")
+IOSTREAM_INCLUDE = re.compile(r"^\s*#\s*include\s*<\s*(?:iostream(?:\.h)?|bits/stdc\+\+\.h)\s*>")
 STDIO_INCLUDE = re.compile(r"^\s*#\s*include\s*<\s*(?:cstdio|stdio\.h|bits/stdc\+\+\.h)\s*>")
 USING_STD = re.compile(r"^\s*using\s+namespace\s+std\s*;")
 # Names from namespace std used without a 'std::' qualifier
@@ -52,6 +54,7 @@ class Diagnostic:
     message: str
     suggestion: str = ""
     replacement: Optional[str] = None
+    source: str = "analyzer"  # analyzer | structure | compiler
 
     def to_dict(self):
         return asdict(self)
@@ -81,6 +84,8 @@ class CompilerAnalyzer:
         self.usages: Dict[str, List[int]] = {}
         self.functions: Dict[str, Dict[str, Any]] = {}
         self.known_constants: Dict[str, str] = {}
+        self.allow_guess_fixes = True  # rename typos / auto-declare variables in Corrected Code
+        self.compiles_clean: Optional[bool] = None  # set by compiler_check() when g++/gcc is available
         self.expression_cache: Dict[str, Tuple[str, int]] = {}
         self.auto_declarations: Dict[str, int] = {}
         self.toplevel_statements: List[Tuple[int, str]] = []
@@ -245,8 +250,13 @@ class CompilerAnalyzer:
 
     def parse(self):
         depth = 0
-        for line_no, raw in enumerate(self.source.splitlines(), 1):
-            no_comment = raw.split("//", 1)[0]
+        in_block = False
+        source_lines = self.source.splitlines()
+        for line_no, raw in enumerate(source_lines, 1):
+            masked, _comment, in_block_after, _ = split_code(raw, in_block)
+            # real code with comments removed (block-comment text blanked out)
+            no_comment = "".join(c if m != " " or c in " \t" else " " for c, m in zip(raw, masked)) if in_block or "/*" in raw else raw[: len(masked)]
+            in_block = in_block_after
             text = no_comment.strip()
 
             # Brace depth tells us whether this line sits inside a function body
@@ -259,13 +269,48 @@ class CompilerAnalyzer:
             if not text:
                 self.corrected_lines.append(raw)
                 continue
-            if text.startswith("#") or text == "using namespace std;" or text in {"{", "}"}:
+            if text.startswith("#") or text == "using namespace std;" or text in {"{", "}", "};"}:
+                self.corrected_lines.append(raw)
+                continue
+
+            # Strip block punctuation so "} else if (x) {" or "for (...) {" parse as headers
+            header = re.sub(r"^\}\s*", "", text)
+            header = re.sub(r"\s*\{$", "", header).strip()
+            header = re.sub(r"^else\s+(?=if\b)", "", header)
+            if header in {"", "else", "do", "try", "default:"} or re.fullmatch(r"case\s+.+:", header):
+                self.corrected_lines.append(raw)
+                continue
+            if re.fullmatch(r"(break|continue)\s*;", header):
+                self.corrected_lines.append(raw)
+                continue
+            # i++; --i; x += 2;  -> uses (and assigns) the variable
+            incdec = re.fullmatch(r"(?:(\+\+|--)\s*([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*(\+\+|--)|([A-Za-z_]\w*)\s*([+\-*/%]=)\s*(.+?))\s*;", header)
+            if incdec:
+                name = incdec.group(2) or incdec.group(3) or incdec.group(5)
+                self.check_expression(name, line_no)
+                if incdec.group(7):
+                    self.check_expression(incdec.group(7), line_no)
+                self.assignments.setdefault(name, []).append(line_no)
+                self.known_constants.pop(name, None)
+                self.corrected_lines.append(raw)
+                continue
+            # cin >> a >> b;
+            cin = re.fullmatch(r"(?:std\s*::\s*)?cin\s*>>\s*(.+?)\s*;", header)
+            if cin:
+                for name in [p.strip() for p in cin.group(1).split(">>")]:
+                    self.check_expression(name, line_no)
+                    if name in self.symbols:
+                        self.assignments.setdefault(name, []).append(line_no)
+                        self.known_constants.pop(name, None)
                 self.corrected_lines.append(raw)
                 continue
 
             function = FUNCTION_DEF.match(text)
-            control = CONTROL.match(text)
-            for_loop = FOR_LOOP.match(text)
+            control = CONTROL.match(header)
+            for_loop = FOR_LOOP.match(header)
+            if re.fullmatch(r"(switch)\s*\((.*)\)", header):
+                self.corrected_lines.append(raw)
+                continue
 
             if function:
                 return_type, name, parameters, _opening_brace = function.groups()
@@ -280,7 +325,16 @@ class CompilerAnalyzer:
 
             if for_loop:
                 init_part, cond_part, update_part = for_loop.groups()
-                if init_part.strip():
+                loop_decl = DECLARATION.match(init_part.strip())
+                if loop_decl:
+                    # for (int i = 0; ...) declares the loop variable
+                    data_type, name, expression = loop_decl.groups()
+                    if expression:
+                        self.check_expression(expression, line_no)
+                    self.symbols[name] = {"type": data_type, "value": "-", "line": line_no}
+                    self.assignments.setdefault(name, []).append(line_no)
+                    self.usages.setdefault(name, []).append(line_no)
+                elif init_part.strip():
                     self.check_expression(init_part, line_no)
                 if cond_part.strip():
                     self.check_expression(cond_part, line_no)
@@ -292,6 +346,11 @@ class CompilerAnalyzer:
             has_semicolon = text.endswith(";")
             statement = text[:-1].strip() if has_semicolon else text
             corrected_stmt = raw
+
+            next_code = next((l.split("//", 1)[0].strip() for l in source_lines[line_no:] if l.split("//", 1)[0].strip()), "")
+            if not has_semicolon and next_code.startswith(("<<", ">>", "+", "-", "*", "/", "&&", "||", "?", ":", ".", ",")):
+                self.corrected_lines.append(raw)
+                continue
 
             if not has_semicolon:
                 likely_statement = bool(DECLARATION.match(statement) or ASSIGNMENT.match(statement)
@@ -337,7 +396,8 @@ class CompilerAnalyzer:
                         suggestion = f"Did you mean '{candidate}'?"
                         self.add("ERROR", line_no, 1, f"'{name}' is not declared.", suggestion, f"{candidate} = {expression};")
                         # Fix in corrected lines
-                        line_to_add = re.sub(rf"\b{re.escape(name)}\b", candidate, corrected_stmt, count=1)
+                        if self.allow_guess_fixes:
+                            line_to_add = re.sub(rf"\b{re.escape(name)}\b", candidate, corrected_stmt, count=1)
                     else:
                         self.auto_declarations.setdefault(name, line_no)
                         suggestion = f"Corrected Code adds: int {name} = 0; before this statement."
@@ -351,7 +411,7 @@ class CompilerAnalyzer:
                 for bad_var in self.identifiers(expression):
                     if bad_var not in self.symbols:
                         choices = difflib.get_close_matches(bad_var, self.symbols.keys(), n=1, cutoff=0.60)
-                        if choices:
+                        if choices and self.allow_guess_fixes:
                             line_to_add = re.sub(rf"\b{re.escape(bad_var)}\b", choices[0], line_to_add)
 
                 self.corrected_lines.append(line_to_add)
@@ -403,11 +463,15 @@ class CompilerAnalyzer:
         entries: List[Tuple[int, str]] = list(enumerate(self.corrected_lines, 1))
 
         # Auto declarations insertion for un-fixable missing variables
-        for name, line_no in sorted(self.auto_declarations.items(), key=lambda item: item[1], reverse=True):
+        guesses = self.auto_declarations if self.allow_guess_fixes else {}
+        for name, line_no in sorted(guesses.items(), key=lambda item: item[1], reverse=True):
             insert_idx = max(0, line_no - 1)
             entries.insert(insert_idx, (line_no, f"    int {name} = 0; // Auto-declared fix"))
 
+        before = len(self.diagnostics)
         entries = self.check_program_structure(entries)
+        for d in self.diagnostics[before:]:
+            d.source = "structure"
         self.corrected_lines = [text for _, text in entries]
 
     @staticmethod
@@ -419,9 +483,21 @@ class CompilerAnalyzer:
             return False
         if FUNCTION_DEF.match(text):
             return False
+        # Any function definition/prototype header, whatever the return type (templates, classes ...)
+        if re.fullmatch(r"(?:[\w:<>,\*&]+\s+)+[\*&]*[\w:~]+\s*\(.*\)\s*(?:const)?\s*(?:\{.*|;)?", text) \
+                and not re.match(r"(?:else\s+)?(?:if|while|for|switch|return)\b", text):
+            return False
+        if re.match(r"(?:public|private|protected)\s*:", text):
+            return False
         statement = text[:-1].strip() if text.endswith(";") else text
         # Global variable declarations are legal outside functions
         if DECLARATION.match(statement):
+            return False
+        # Type definitions and other declarations: struct/class/enum, typedef, template, arrays, const ...
+        if re.match(r"^(struct|class|enum|union|typedef|template|namespace|extern|static|const|constexpr|"
+                    r"unsigned|signed|long|short|auto|int|float|double|char|bool|string|void|std\s*::|vector\s*<)\b", statement):
+            return False
+        if text.startswith("}") or text.startswith("{"):
             return False
         # Function prototypes, e.g. "int add(int a, int b);"
         if re.match(r"^(int|float|double|char|void|bool|string)\s+[A-Za-z_]\w*\s*\(.*\)$", statement):
@@ -517,11 +593,7 @@ class CompilerAnalyzer:
                          "Add:  int main() {  ...your statements...  return 0; }",
                          "int main() {")
 
-        # ---- Build the corrected program ----
-        if not full and not has_main:
-            # Snippets keep their original shape in Corrected Code
-            return entries
-
+        # ---- Build the corrected program (always a complete, standard program) ----
         prefix: List[Tuple[int, str]] = []
         if iostream_line and not has_iostream:
             prefix.append((0, "#include <iostream>"))
@@ -529,12 +601,32 @@ class CompilerAnalyzer:
             prefix.append((0, "#include <stdio.h>" if self.language == "c" else "#include <cstdio>"))
 
         if not has_main:
-            toplevel = {no for no, _ in self.toplevel_statements}
-            body = [(no, "    " + t.strip()) for no, t in entries if no in toplevel]
-            outside = [(no, t) for no, t in entries if no not in toplevel]
+            if full:
+                toplevel = {no for no, _ in self.toplevel_statements}
+                in_main = lambda no, t: no in toplevel
+            else:
+                # Snippet: everything except directives goes inside main()
+                in_main = lambda no, t: not t.strip().startswith(("#", "using "))
+            body = [(no, ("    " + t) if t.strip() else "") for no, t in entries if in_main(no, t)]
+            outside = [(no, t) for no, t in entries if not in_main(no, t)]
             while outside and not outside[-1][1].strip():
                 outside.pop()
-            entries = outside + [(0, ""), (0, "int main() {")] + body + [(0, "    return 0;"), (0, "}")]
+            while body and not body[-1][1].strip():
+                body.pop()
+            # Re-indent the body relative to its least-indented line
+            indents = [len(t) - len(t.lstrip()) for _, t in body if t.strip()]
+            strip = (min(indents) - 4) if indents else 0
+            body = [(no, t[strip:] if t.strip() else t) for no, t in body]
+            entries = outside + ([(0, "")] if outside else []) + [(0, "int main() {")] + body + [(0, "    return 0;"), (0, "}")]
+        elif self.toplevel_statements:
+            # main() exists, but statements were written outside it: move them to the top of main()
+            toplevel = {no for no, _ in self.toplevel_statements}
+            moved = [(no, "    " + t.strip()) for no, t in entries if no in toplevel]
+            entries = [(no, t) for no, t in entries if no not in toplevel]
+            main_idx = next((i for i, (_, t) in enumerate(entries) if MAIN_DEF.search(t)), None)
+            if main_idx is not None:
+                brace_idx = next((i for i in range(main_idx, len(entries)) if "{" in entries[i][1]), main_idx)
+                entries[brace_idx + 1:brace_idx + 1] = moved
 
         if unqualified_line and not has_using_std:
             # Place 'using namespace std;' right after the last #include
@@ -554,6 +646,114 @@ class CompilerAnalyzer:
         self.lex()
         self.parse()
         return self
+
+    # ------------------------------------------------------------------
+    # Real-compiler verification: g++/gcc is the authority on the ISO standard
+    # ------------------------------------------------------------------
+    def compiler_check(self):
+        fixer = AutoFixer(self.source, self.language)
+        if not fixer.compiler:
+            return
+        lines = self.source.splitlines()
+        offset = 0
+        code = self.source
+        if not self.is_full_program():
+            # Snippet: compile it the way the runner will run it
+            header = ["#include <stdio.h>"] if self.language == "c" else \
+                     ["#include <iostream>", "#include <cstdio>", "#include <string>", "using namespace std;"]
+            header.append("int main() {")
+            offset = len(header)
+            code = "\n".join(header + lines + ["return 0;", "}"])
+        diags = fixer.compile_diagnostics(code)
+        if diags is None:
+            return
+        errors = []
+        for d in diags:
+            if d["kind"] not in {"error", "fatal error"}:
+                continue
+            line = d["line"] - offset
+            if re.match(r"expected '(;|,)'", d["message"]) and 1 <= line <= len(lines):
+                # gcc points at the token AFTER the missing ';' - report the line that needs it
+                before = lines[line - 1][: max(0, d["column"] - 1)]
+                if not before.strip():
+                    prev = line - 1
+                    while prev >= 1 and not lines[prev - 1].split("//", 1)[0].strip():
+                        prev -= 1
+                    if prev >= 1:
+                        line = prev
+                        d = {**d, "column": len(lines[prev - 1].rstrip()) + 1}
+            if 1 <= line <= len(lines):
+                errors.append((line, d))
+
+        self.compiles_clean = not errors
+        if not errors:
+            # The real compiler accepts the code: our pattern-based ERRORs were false alarms.
+            # Structural errors stay (e.g. a missing main() is only caught by the linker).
+            self.diagnostics = [d for d in self.diagnostics
+                                if d.level != "ERROR" or d.message.startswith("No 'int main()'")]
+            return
+
+        vague = ("Invalid statement syntax", "Unsupported C/C++ statement")
+        compiler_text = " ".join(d["message"] for _, d in errors)
+        stray_lines = {line for line, d in errors if d["message"].startswith(("stray", "missing terminating"))}
+
+        def confirmed(diag) -> bool:
+            if diag.level != "ERROR" or diag.source == "structure":
+                return True
+            if diag.message.startswith(vague):
+                return False
+            m = re.match(r"(?:Function )?'([A-Za-z_]\w*)' is not declared", diag.message)
+            if m:
+                return f"'{m.group(1)}'" in compiler_text
+            if diag.message.startswith("Invalid character"):
+                return diag.line in stray_lines
+            return True
+
+        self.diagnostics = [d for d in self.diagnostics if confirmed(d)]
+        flagged = {d.line for d in self.diagnostics if d.level == "ERROR"}
+        for line, d in errors:
+            if line in flagged:
+                continue
+            flagged.add(line)
+            self.add("ERROR", line, d["column"], f"{d['message']}",
+                     "Click 'Fix All Errors' to repair this automatically.", None)
+            self.diagnostics[-1].source = "compiler"
+
+    def build_corrected_code(self) -> Tuple[str, List[str]]:
+        """
+        Rules first (typos, << vs <, ';', braces, headers, main...), then the analyzer's
+        own fixes and program structure, then a compile-and-repair loop with g++/gcc.
+        """
+        fixer = AutoFixer(self.source, self.language)
+        if self.compiles_clean:
+            # Valid code is never rewritten. Only a missing main() is added.
+            has_main = any(MAIN_DEF.search(split_code(l)[0]) for l in self.source.splitlines())
+            if has_main:
+                return self.source, []
+            wrapper = CompilerAnalyzer(self.source, self.language)
+            wrapper.allow_guess_fixes = False
+            wrapper.lex()
+            wrapper.parse()
+            fixer.note(0, "Added the int main() entry point required by every C/C++ program.")
+            return fixer.compiler_loop("\n".join(wrapper.corrected_lines)), fixer.fixes
+        stage1 = fixer.prepass(self.source)
+        second = CompilerAnalyzer(stage1, self.language)
+        second.allow_guess_fixes = fixer.compiler is None
+        second.lex()
+        second.parse()
+        for d in second.diagnostics:
+            if d.source != "structure":
+                continue
+            if "int main()" in d.message or "Snippet mode" in d.message:
+                fixer.note(0, "Put the statements inside int main() { ... return 0; }.")
+            if "namespace std" in d.message or "'using namespace std;'" in d.message:
+                fixer.note(0, "Added 'using namespace std;'.")
+            m = re.search(r"#include <([\w.]+)>", d.message)
+            if m:
+                fixer.note(0, f"Added '#include <{m.group(1)}>'.")
+        stage2 = fixer.prepass("\n".join(second.corrected_lines))
+        final = fixer.compiler_loop(stage2)
+        return final, fixer.fixes
 
     def execute_code(self) -> Dict[str, Any]:
         """
@@ -713,9 +913,12 @@ class CompilerAnalyzer:
         }
 
     def get_results(self) -> Dict[str, Any]:
+        # Verify with the real compiler before deciding what is an error
+        self.compiler_check()
         errors = sum(1 for d in self.diagnostics if d.level == "ERROR")
         warnings = sum(1 for d in self.diagnostics if d.level == "WARNING")
-        
+        corrected_code, fixes = self.build_corrected_code()
+
         # Execute program
         execution_res = self.execute_code()
 
@@ -727,7 +930,8 @@ class CompilerAnalyzer:
             ],
             "diagnostics": [d.to_dict() for d in self.diagnostics],
             "optimizations": self.optimizations,
-            "corrected_code": "\n".join(self.corrected_lines),
+            "corrected_code": corrected_code,
+            "fixes": fixes,
             "execution": execution_res,
             "summary": {
                 "token_count": len(self.tokens),

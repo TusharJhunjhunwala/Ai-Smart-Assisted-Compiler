@@ -111,11 +111,16 @@ def fix_all_errors(req: FixAllRequest):
     ))
     diff_text = "".join(diff)
 
+    # Count the distinct places that were changed
+    matcher = difflib.SequenceMatcher(None, req.source.splitlines(), corrected.splitlines())
+    changed = sum(1 for tag, *_ in matcher.get_opcodes() if tag != "equal")
+
     return {
         "original_code": req.source,
         "corrected_code": corrected,
         "diff": diff_text,
-        "fixed_count": len(results["diagnostics"])
+        "fixed_count": max(changed, len(results.get("fixes", []))),
+        "fixes": results.get("fixes", []),
     }
 
 if __name__ == "__main__":
