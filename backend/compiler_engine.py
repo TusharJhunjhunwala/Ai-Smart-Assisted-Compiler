@@ -17,7 +17,7 @@ TOKEN_PATTERN = re.compile(
     r"(?P<SPACE>[ \t]+)|(?P<PREPROCESSOR>\#[^\n]*)|(?P<COMMENT>//[^\n]*)|"
     r"(?P<FLOAT>\d+\.\d+)|(?P<NUMBER>\d+)|"
     r"(?P<STRING>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')|"
-    r"(?P<ID>[A-Za-z_]\w*)|(?P<OP><<|>>|<=|>=|==|!=|\+\+|--|[+\-*/%=<>])|"
+    r"(?P<ID>[A-Za-z_]\w*)|(?P<OP>::|<<|>>|<=|>=|==|!=|\+\+|--|[+\-*/%=<>])|"
     r"(?P<DELIM>[(){};,])|(?P<INVALID>.)"
 )
 
@@ -31,8 +31,17 @@ FUNCTION_DEF = re.compile(r"^(int|float|double|char|void|bool|string)\s+([A-Za-z
 CONTROL = re.compile(r"^(if|while)\s*\((.*?)\)$")
 FOR_LOOP = re.compile(r"^for\s*\((.*?);(.*?);(.*?)\)$")
 RETURN = re.compile(r"^return(?:\s+(.+))?$")
-COUT = re.compile(r"^cout\s*<<\s*(.+)$")
+COUT = re.compile(r"^(?:std\s*::\s*)?cout\s*<<\s*(.+)$")
 IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*\b")
+STRING_LITERAL = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'")
+MAIN_DEF = re.compile(r"\b(?:int|void)\s+main\s*\(")
+IOSTREAM_INCLUDE = re.compile(r"^\s*#\s*include\s*<\s*(?:iostream|bits/stdc\+\+\.h)\s*>")
+STDIO_INCLUDE = re.compile(r"^\s*#\s*include\s*<\s*(?:cstdio|stdio\.h|bits/stdc\+\+\.h)\s*>")
+USING_STD = re.compile(r"^\s*using\s+namespace\s+std\s*;")
+# Names from namespace std used without a 'std::' qualifier
+UNQUALIFIED_STD = re.compile(r"(?<!::)(?<!::\s)\b(cout|cin|cerr|endl|string)\b")
+IOSTREAM_NAMES = re.compile(r"\b(cout|cin|cerr|endl)\b")
+PRINTF_CALL = re.compile(r"\b(printf|scanf|puts)\s*\(")
 
 
 @dataclass
@@ -74,6 +83,7 @@ class CompilerAnalyzer:
         self.known_constants: Dict[str, str] = {}
         self.expression_cache: Dict[str, Tuple[str, int]] = {}
         self.auto_declarations: Dict[str, int] = {}
+        self.toplevel_statements: List[Tuple[int, str]] = []
 
     def add(self, level: str, line: int, column: int, message: str, suggestion: str = "", replacement: Optional[str] = None):
         self.diagnostics.append(Diagnostic(level, line, column, message, suggestion, replacement))
@@ -234,9 +244,18 @@ class CompilerAnalyzer:
         return optimized
 
     def parse(self):
+        depth = 0
         for line_no, raw in enumerate(self.source.splitlines(), 1):
             no_comment = raw.split("//", 1)[0]
             text = no_comment.strip()
+
+            # Brace depth tells us whether this line sits inside a function body
+            depth_before = depth
+            code_only = STRING_LITERAL.sub("", no_comment)
+            depth = max(0, depth + code_only.count("{") - code_only.count("}"))
+            if depth_before == 0 and self._is_executable_statement(text):
+                self.toplevel_statements.append((line_no, text))
+
             if not text:
                 self.corrected_lines.append(raw)
                 continue
@@ -380,13 +399,156 @@ class CompilerAnalyzer:
                                                 for i in range(len(assignments) - 1) for u in used):
                 self.add("WARNING", assignments[0], 1, f"Earlier assignment to '{name}' is overwritten before use.", f"Check if initial value of '{name}' is redundant.")
 
+        # corrected_lines is 1:1 with source lines here; tag each with its source line
+        entries: List[Tuple[int, str]] = list(enumerate(self.corrected_lines, 1))
+
         # Auto declarations insertion for un-fixable missing variables
         for name, line_no in sorted(self.auto_declarations.items(), key=lambda item: item[1], reverse=True):
             insert_idx = max(0, line_no - 1)
-            self.corrected_lines.insert(
-                insert_idx,
-                f"    int {name} = 0; // Auto-declared fix"
-            )
+            entries.insert(insert_idx, (line_no, f"    int {name} = 0; // Auto-declared fix"))
+
+        entries = self.check_program_structure(entries)
+        self.corrected_lines = [text for _, text in entries]
+
+    @staticmethod
+    def _is_executable_statement(text: str) -> bool:
+        """True for lines that must live inside a function body (cout, assignments, loops, return...)."""
+        if not text or text.startswith("#") or text.startswith("using ") or text.startswith("namespace "):
+            return False
+        if set(text) <= {"{", "}", ";", " "}:
+            return False
+        if FUNCTION_DEF.match(text):
+            return False
+        statement = text[:-1].strip() if text.endswith(";") else text
+        # Global variable declarations are legal outside functions
+        if DECLARATION.match(statement):
+            return False
+        # Function prototypes, e.g. "int add(int a, int b);"
+        if re.match(r"^(int|float|double|char|void|bool|string)\s+[A-Za-z_]\w*\s*\(.*\)$", statement):
+            return False
+        return True
+
+    def is_full_program(self) -> bool:
+        """A source is a full program (not a quick snippet) once it has headers, a namespace or functions."""
+        lines = self.source.splitlines()
+        return (
+            any(l.strip().startswith("#") for l in lines)
+            or any(USING_STD.match(l) for l in lines)
+            or bool(self.functions)
+        )
+
+    def check_program_structure(self, entries: List[Tuple[int, str]]) -> List[Tuple[int, str]]:
+        """
+        Whole-program checks a real C/C++ compiler/linker would enforce:
+        a main() entry point, statements inside functions, the right headers and namespace.
+
+        Full programs get ERRORs. Bare snippets (no headers, no functions) are still allowed
+        to run - they are auto-wrapped - but INFO diagnostics say exactly what was assumed.
+        """
+        lines = self.source.splitlines()
+        code_lines = [STRING_LITERAL.sub('""', l.split("//", 1)[0]) for l in lines]
+        full = self.is_full_program()
+        has_main = any(MAIN_DEF.search(l) for l in code_lines)
+        has_iostream = any(IOSTREAM_INCLUDE.match(l) for l in lines)
+        has_stdio = any(STDIO_INCLUDE.match(l) for l in lines)
+        has_using_std = any(USING_STD.match(l) for l in lines)
+
+        def first_line(pattern) -> Optional[int]:
+            for no, l in enumerate(code_lines, 1):
+                if not l.strip().startswith("#") and pattern.search(l):
+                    return no
+            return None
+
+        iostream_line = first_line(IOSTREAM_NAMES)
+        stdio_line = first_line(PRINTF_CALL)
+        unqualified_line = first_line(UNQUALIFIED_STD) if self.language == "cpp" else None
+
+        if not full:
+            # Snippet mode: the runner wraps the code, so explain what it assumes in one note
+            assumed = []
+            if iostream_line and not has_iostream:
+                assumed.append("#include <iostream>")
+            if stdio_line and not has_stdio and not has_iostream:
+                assumed.append("#include <stdio.h>" if self.language == "c" else "#include <cstdio>")
+            if unqualified_line and not has_using_std:
+                assumed.append("using namespace std;")
+            if not has_main and self.toplevel_statements:
+                assumed.append("int main() { ... return 0; }")
+            if assumed:
+                self.add("INFO", 1, 1,
+                         "Snippet mode: this is not a complete program. To run it, the compiler adds "
+                         + ", ".join(f"'{a}'" for a in assumed) + ".",
+                         "Write these yourself to make it a complete C/C++ program.")
+        else:
+            # 1. Missing headers
+            if iostream_line and not has_iostream:
+                name = IOSTREAM_NAMES.search(code_lines[iostream_line - 1]).group(1)
+                self.add("ERROR", iostream_line, 1,
+                         f"'{name}' is used but '#include <iostream>' is missing.",
+                         "Add '#include <iostream>' at the top of the file.", "#include <iostream>")
+            if stdio_line and not has_stdio and not has_iostream:
+                name = PRINTF_CALL.search(code_lines[stdio_line - 1]).group(1)
+                header = "<stdio.h>" if self.language == "c" else "<cstdio>"
+                self.add("WARNING", stdio_line, 1,
+                         f"'{name}()' is used but '#include {header}' is missing.",
+                         f"Add '#include {header}' at the top of the file.", f"#include {header}")
+
+            # 2. Missing 'using namespace std;'
+            if unqualified_line and not has_using_std:
+                name = UNQUALIFIED_STD.search(code_lines[unqualified_line - 1]).group(1)
+                self.add("ERROR", unqualified_line, 1,
+                         f"'{name}' was not declared in this scope: it lives in namespace std.",
+                         f"Add 'using namespace std;' after your #include lines, or write 'std::{name}'.",
+                         "using namespace std;")
+
+            # 3. Statements outside any function
+            for line_no, text in self.toplevel_statements:
+                self.add("ERROR", line_no, 1,
+                         f"Statement '{text}' is outside any function. "
+                         "Executable statements must be inside a function body such as int main() { ... }.",
+                         "Move this statement inside int main() { ... }.")
+
+            # 4. Missing main()
+            if not has_main:
+                at = self.toplevel_statements[0][0] if self.toplevel_statements else max(1, len(lines))
+                self.add("ERROR", at, 1,
+                         "No 'int main()' function is defined. Every C/C++ program needs main() as its entry point "
+                         "(the linker reports: undefined reference to 'main').",
+                         "Add:  int main() {  ...your statements...  return 0; }",
+                         "int main() {")
+
+        # ---- Build the corrected program ----
+        if not full and not has_main:
+            # Snippets keep their original shape in Corrected Code
+            return entries
+
+        prefix: List[Tuple[int, str]] = []
+        if iostream_line and not has_iostream:
+            prefix.append((0, "#include <iostream>"))
+        if stdio_line and not has_stdio and not has_iostream:
+            prefix.append((0, "#include <stdio.h>" if self.language == "c" else "#include <cstdio>"))
+
+        if not has_main:
+            toplevel = {no for no, _ in self.toplevel_statements}
+            body = [(no, "    " + t.strip()) for no, t in entries if no in toplevel]
+            outside = [(no, t) for no, t in entries if no not in toplevel]
+            while outside and not outside[-1][1].strip():
+                outside.pop()
+            entries = outside + [(0, ""), (0, "int main() {")] + body + [(0, "    return 0;"), (0, "}")]
+
+        if unqualified_line and not has_using_std:
+            # Place 'using namespace std;' right after the last #include
+            last_include = max((i for i, (_, t) in enumerate(entries) if t.strip().startswith("#")), default=-1)
+            if last_include >= 0:
+                entries.insert(last_include + 1, (0, "using namespace std;"))
+            else:
+                prefix.append((0, "using namespace std;"))
+
+        if prefix:
+            first = entries[0][1].strip() if entries else ""
+            gap = [(0, "")] if first and not first.startswith(("#", "using ")) else []
+            entries = prefix + gap + entries
+        return entries
 
     def analyze(self):
         self.lex()
@@ -439,9 +601,18 @@ class CompilerAnalyzer:
             full_cpp.append("using namespace std;")
 
         if not has_main:
-            # Wrap standalone top-level statements inside main()
-            full_cpp.append("int main() {")
+            # Wrap standalone top-level statements inside main(), but keep
+            # preprocessor directives and 'using' declarations at file scope -
+            # putting '#include <iostream>' inside main() breaks the std headers.
+            body = []
             for line in executable_code.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#") or stripped.startswith("using "):
+                    full_cpp.append(line)
+                else:
+                    body.append(line)
+            full_cpp.append("int main() {")
+            for line in body:
                 full_cpp.append("    " + line)
             full_cpp.append("    return 0;")
             full_cpp.append("}")
