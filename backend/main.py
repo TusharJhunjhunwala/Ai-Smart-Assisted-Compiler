@@ -1,4 +1,5 @@
 import os
+import re
 import difflib
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,8 +8,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from compiler_engine import CompilerAnalyzer
+from autofix import AutoFixer, warm_up
 from ai_service import ai_service
-from models import AnalyzeRequest, AutocompleteRequest, ExplainFixRequest, FixAllRequest
+from models import AnalyzeRequest, AutocompleteRequest, ExplainFixRequest, FixAllRequest, FixDiagnosticRequest
 from examples import SAMPLE_PROGRAMS
 
 app = FastAPI(
@@ -16,6 +18,9 @@ app = FastAPI(
     description="Backend compiler analysis, predictive code completion, and diagnostic explanation engine.",
     version="2.0.0"
 )
+
+# Precompile <iostream> in the background so the first Fix All is already fast
+warm_up(AutoFixer.find_compiler())
 
 # Enable CORS for React frontend (Vite default port 5173 or other local dev ports)
 app.add_middleware(
@@ -97,9 +102,8 @@ def fix_all_errors(req: FixAllRequest):
     """
     analyzer = CompilerAnalyzer(source=req.source, language=req.language)
     analyzer.analyze()
-    results = analyzer.get_results()
-    corrected = results["corrected_code"]
-    
+    corrected, fixes = analyzer.corrected_only()
+
     # Generate unified diff
     orig_lines = req.source.splitlines(keepends=True)
     corr_lines = corrected.splitlines(keepends=True)
@@ -119,9 +123,73 @@ def fix_all_errors(req: FixAllRequest):
         "original_code": req.source,
         "corrected_code": corrected,
         "diff": diff_text,
-        "fixed_count": max(changed, len(results.get("fixes", []))),
-        "fixes": results.get("fixes", []),
+        "fixed_count": max(changed, len(fixes)) if corrected != req.source else 0,
+        "fixes": fixes,
     }
+
+
+STRUCTURAL = re.compile(r"^(#\s*include\b.*|using namespace std;|int main\(\) \{|return 0;|\}|\{|)$")
+
+
+@app.post("/api/fix-diagnostic")
+def fix_single_diagnostic(req: FixDiagnosticRequest):
+    """
+    Apply only the part of the full correction that repairs ONE diagnostic.
+    The whole program is corrected first, then only the change at that line is kept.
+    """
+    analyzer = CompilerAnalyzer(source=req.source, language=req.language)
+    analyzer.analyze()
+    corrected, fixes = analyzer.corrected_only()
+    orig, corr = req.source.splitlines(), corrected.splitlines()
+    if orig == corr:
+        return {"fixed_code": req.source, "applied": False,
+                "message": "Nothing to change automatically for this diagnostic."}
+
+    # Align ignoring indentation, so wrapping code in main() does not count as a change
+    matcher = difflib.SequenceMatcher(None, [l.strip() for l in orig], [l.strip() for l in corr], autojunk=False)
+    ops = []
+    for op in matcher.get_opcodes():
+        tag, i1, i2, j1, j2 = op
+        if tag == "equal":
+            continue
+        if tag == "replace" and i2 - i1 == j2 - j1:
+            # neighbouring edited lines are separate fixes: one click, one line
+            ops.extend(("replace", i1 + k, i1 + k + 1, j1 + k, j1 + k + 1) for k in range(i2 - i1))
+        else:
+            ops.append(op)
+    target = max(0, int(req.diagnostic.get("line", 1)) - 1)
+    structural = req.diagnostic.get("source") == "structure" or req.diagnostic.get("level") == "INFO"
+
+    def is_structural(op):
+        _, i1, i2, j1, j2 = op
+        return all(STRUCTURAL.match(l.strip()) for l in orig[i1:i2] + corr[j1:j2])
+
+    def distance(op):
+        _, i1, i2, _, _ = op
+        return 0 if i1 <= target < max(i2, i1 + 1) else min(abs(target - i1), abs(target - (i2 - 1)))
+
+    if structural:
+        chosen = [op for op in ops if is_structural(op)] or ops
+    else:
+        exact = [op for op in ops if distance(op) == 0]
+        near = exact or [op for op in ops if distance(op) <= 1][:1]
+        chosen = near or ([min(ops, key=distance)] if ops and distance(min(ops, key=distance)) <= 4 else [])
+    if not chosen:
+        return {"fixed_code": req.source, "applied": False,
+                "message": "No automatic fix found near this line. Try Fix All Errors."}
+
+    result = list(orig)
+    for tag, i1, i2, j1, j2 in sorted(chosen, key=lambda op: op[1], reverse=True):
+        replacement = corr[j1:j2]
+        if i2 - i1 == j2 - j1:
+            # keep the user's own indentation on lines that were edited in place
+            replacement = [re.match(r"\s*", o).group(0) + c.lstrip() if o.strip() else c
+                           for o, c in zip(orig[i1:i2], replacement)]
+        result[i1:i2] = replacement
+    fixed = "\n".join(result)
+    return {"fixed_code": fixed, "applied": fixed != req.source,
+            "message": "Applied the fix." if fixed != req.source else "Nothing to change."}
+
 
 if __name__ == "__main__":
     import uvicorn

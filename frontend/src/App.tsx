@@ -22,6 +22,8 @@ export const App: React.FC = () => {
   const [selectedExampleId, setSelectedExampleId] = useState<string>('errors_and_opt');
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
   const [analysisData, setAnalysisData] = useState<AnalysisResponse | null>(null);
+  // The exact source the last analysis was run on (lets Fix All open instantly)
+  const [analyzedSource, setAnalyzedSource] = useState<string | null>(null);
 
   // AI & Ghost text
   const [aiEnabled, setAiEnabled] = useState<boolean>(true);
@@ -38,6 +40,8 @@ export const App: React.FC = () => {
   // Fix All Diff Modal
   const [isDiffModalOpen, setIsDiffModalOpen] = useState<boolean>(false);
   const [diffData, setDiffData] = useState<FixAllResponse | null>(null);
+  const [isFixing, setIsFixing] = useState<boolean>(false);
+  const [fixingLine, setFixingLine] = useState<number | null>(null);
 
   // Status bar
   const [cursorPos, setCursorPos] = useState<{ line: number; col: number }>({ line: 1, col: 1 });
@@ -67,16 +71,18 @@ export const App: React.FC = () => {
   }, []);
 
   // Run Compiler Analysis
-  const handleAnalyze = async () => {
-    if (!code.trim()) {
+  const handleAnalyze = async (sourceOverride?: string) => {
+    const source = sourceOverride ?? code;
+    if (!source.trim()) {
       setStatusMessage('Warning: Code is empty.');
       return;
     }
     setIsAnalyzing(true);
     setStatusMessage('Analyzing program syntax & semantics...');
     try {
-      const res = await api.analyze(code, language);
+      const res = await api.analyze(source, language);
       setAnalysisData(res);
+      setAnalyzedSource(source);
       setStatusMessage(
         `Analysis complete: ${res.summary.errors} error(s), ${res.summary.warnings} warning(s), ${res.summary.optimization_count} optimization(s).`
       );
@@ -124,34 +130,65 @@ export const App: React.FC = () => {
   };
 
   // Apply single diagnostic fix
-  const handleApplySingleFix = (diag: DiagnosticItem) => {
-    if (diag.replacement) {
-      // Replace in code directly
-      const lines = code.split('\n');
-      if (diag.line <= lines.length) {
-        lines[diag.line - 1] = diag.replacement;
-        const newCode = lines.join('\n');
-        setCode(newCode);
-        setStatusMessage(`Applied fix for diagnostic on Line ${diag.line}.`);
-        return;
+  // The backend corrects the whole program, then keeps only the change for this diagnostic.
+  const handleApplySingleFix = async (diag: DiagnosticItem) => {
+    setFixingLine(diag.line);
+    setStatusMessage(`Fixing line ${diag.line}...`);
+    try {
+      const res = await api.fixDiagnostic(code, language, diag);
+      if (res.applied) {
+        setCode(res.fixed_code);
+        setStatusMessage(`Applied fix for line ${diag.line}. Re-checking...`);
+        await handleAnalyze(res.fixed_code); // refresh the diagnostics list
+      } else {
+        setStatusMessage(res.message);
       }
+    } catch (err) {
+      console.error(err);
+      setStatusMessage('Could not apply the fix.');
+    } finally {
+      setFixingLine(null);
     }
-    // Fallback if no direct replacement: trigger fix-all or inform
-    setStatusMessage(`Use Fix All Errors or manually review suggestion: ${diag.suggestion}`);
   };
 
   // Trigger Fix All Preview Modal
   const handleFixAll = async () => {
     if (!code.trim()) return;
+    // Open the dialog immediately; fill it as soon as the fix is ready
+    setDiffData(null);
+    setIsDiffModalOpen(true);
+
+    // Already analyzed this exact code? The corrected version is already here: no request needed.
+    if (analysisData && analyzedSource === code) {
+      const before = code.split('\n');
+      const after = analysisData.corrected_code.split('\n');
+      const changed = Math.max(
+        analysisData.fixes?.length || 0,
+        after.filter((l, i) => l !== before[i]).length
+      );
+      setDiffData({
+        original_code: code,
+        corrected_code: analysisData.corrected_code,
+        diff: '',
+        fixed_count: analysisData.corrected_code === code ? 0 : changed,
+        fixes: analysisData.fixes,
+      });
+      setStatusMessage('Reviewing proposed code fixes.');
+      return;
+    }
+
+    setIsFixing(true);
     setStatusMessage('Generating non-destructive fix patch...');
     try {
       const res = await api.fixAll(code, language);
       setDiffData(res);
-      setIsDiffModalOpen(true);
       setStatusMessage('Reviewing proposed code fixes.');
     } catch (err) {
       console.error(err);
+      setIsDiffModalOpen(false);
       setStatusMessage('Failed to generate fix diff.');
+    } finally {
+      setIsFixing(false);
     }
   };
 
@@ -165,7 +202,7 @@ export const App: React.FC = () => {
       <Navbar
         language={language}
         setLanguage={setLanguage}
-        onAnalyze={handleAnalyze}
+        onAnalyze={() => handleAnalyze()}
         onClear={handleClear}
         onFixAll={handleFixAll}
         examples={examples}
@@ -202,6 +239,7 @@ export const App: React.FC = () => {
           <OutputPanel
             data={analysisData}
             onApplyFix={handleApplySingleFix}
+            fixingLine={fixingLine}
             onExplainDiag={handleExplainDiagnostic}
             onApplyCorrectedCode={(newCode) => {
               setCode(newCode);
@@ -238,9 +276,11 @@ export const App: React.FC = () => {
         isOpen={isDiffModalOpen}
         onClose={() => setIsDiffModalOpen(false)}
         data={diffData}
+        loading={isFixing || (isDiffModalOpen && !diffData)}
         onAccept={(correctedCode) => {
           setCode(correctedCode);
-          setStatusMessage('Accepted all proposed compiler corrections.');
+          setStatusMessage('Accepted all proposed compiler corrections. Re-checking...');
+          handleAnalyze(correctedCode);
         }}
       />
 

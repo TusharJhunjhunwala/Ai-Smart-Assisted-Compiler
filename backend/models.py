@@ -29,3 +29,8 @@ class ExampleItem(BaseModel):
     description: str
     language: str
     code: str
+
+class FixDiagnosticRequest(BaseModel):
+    source: str
+    language: str = "cpp"
+    diagnostic: Dict[str, Any]

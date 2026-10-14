@@ -7,7 +7,7 @@ import shutil
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple, Any
 
-from autofix import AutoFixer, split_code
+from autofix import AutoFixer, split_code, pch_flags, CPP_FLAGS
 
 KEYWORDS = {
     "int", "float", "char", "double", "void", "return", "if", "else", "while", "for",
@@ -44,6 +44,12 @@ USING_STD = re.compile(r"^\s*using\s+namespace\s+std\s*;")
 UNQUALIFIED_STD = re.compile(r"(?<!::)(?<!::\s)\b(cout|cin|cerr|endl|string)\b")
 IOSTREAM_NAMES = re.compile(r"\b(cout|cin|cerr|endl)\b")
 PRINTF_CALL = re.compile(r"\b(printf|scanf|puts)\s*\(")
+
+
+# Compiler warnings that are almost always real bugs (and that Fix All repairs)
+FIXABLE_WARNINGS = (r"operand of comma operator has no effect|suggest parentheses around assignment used as truth value|suggest braces around empty body|"
+                    r"does not guard|used uninitialized|control reaches end of non-void function|"
+                    r"no return statement in function returning non-void|format '%\w+' expects argument of type '[^']*\*'")
 
 
 @dataclass
@@ -499,6 +505,9 @@ class CompilerAnalyzer:
             return False
         if text.startswith("}") or text.startswith("{"):
             return False
+        # A function definition written without a return type:  add(int a, int b) {
+        if re.match(r"^[A-Za-z_]\w*\s*\(.*\)\s*\{?$", text) and not re.match(r"(if|for|while|switch|return)\b", text):
+            return False
         # Function prototypes, e.g. "int add(int a, int b);"
         if re.match(r"^(int|float|double|char|void|bool|string)\s+[A-Za-z_]\w*\s*\(.*\)$", statement):
             return False
@@ -669,9 +678,12 @@ class CompilerAnalyzer:
             return
         errors = []
         for d in diags:
+            line = d["line"] - offset
+            if d["kind"] == "warning" and re.search(FIXABLE_WARNINGS, d["message"]) and 1 <= line <= len(lines):
+                self.add("WARNING", line, d["column"], d["message"], "Click 'Fix All Errors' or 'Apply Fix' to repair it.")
+                self.diagnostics[-1].source = "compiler"
             if d["kind"] not in {"error", "fatal error"}:
                 continue
-            line = d["line"] - offset
             if re.match(r"expected '(;|,)'", d["message"]) and 1 <= line <= len(lines):
                 # gcc points at the token AFTER the missing ';' - report the line that needs it
                 before = lines[line - 1][: max(0, d["column"] - 1)]
@@ -685,6 +697,11 @@ class CompilerAnalyzer:
             if 1 <= line <= len(lines):
                 errors.append((line, d))
 
+        # The analyzer's pattern-based "never used" warnings are only kept when gcc agrees
+        unused = {m.group(1) for d in diags for m in [re.search(r"unused variable '(\w+)'", d["message"])] if m}
+        self.diagnostics = [d for d in self.diagnostics if not (
+            d.level == "WARNING" and d.source == "analyzer"
+            and (m := re.match(r"'(\w+)' is declared but never used", d.message)) and m.group(1) not in unused)]
         self.compiles_clean = not errors
         if not errors:
             # The real compiler accepts the code: our pattern-based ERRORs were false alarms.
@@ -703,8 +720,8 @@ class CompilerAnalyzer:
             if diag.message.startswith(vague):
                 return False
             m = re.match(r"(?:Function )?'([A-Za-z_]\w*)' is not declared", diag.message)
-            if m:
-                return f"'{m.group(1)}'" in compiler_text
+            if m:  # keep our friendlier message only where the compiler reports the same name
+                return any(f"'{m.group(1)}'" in d["message"] and line == diag.line for line, d in errors)
             if diag.message.startswith("Invalid character"):
                 return diag.line in stray_lines
             return True
@@ -729,7 +746,7 @@ class CompilerAnalyzer:
             # Valid code is never rewritten. Only a missing main() is added.
             has_main = any(MAIN_DEF.search(split_code(l)[0]) for l in self.source.splitlines())
             if has_main:
-                return self.source, []
+                return fixer.compiler_loop(self.source), fixer.fixes
             wrapper = CompilerAnalyzer(self.source, self.language)
             wrapper.allow_guess_fixes = False
             wrapper.lex()
@@ -794,11 +811,15 @@ class CompilerAnalyzer:
         has_namespace = "using namespace std;" in executable_code
 
         full_cpp = []
-        if not has_include:
-            full_cpp.append("#include <iostream>")
-            full_cpp.append("#include <cstdio>")
-        if not has_namespace:
-            full_cpp.append("using namespace std;")
+        if self.language == "c":
+            if not has_include:
+                full_cpp.append("#include <stdio.h>")
+        else:
+            if not has_include:
+                full_cpp.append("#include <iostream>")
+                full_cpp.append("#include <cstdio>")
+            if not has_namespace:
+                full_cpp.append("using namespace std;")
 
         if not has_main:
             # Wrap standalone top-level statements inside main(), but keep
@@ -833,7 +854,7 @@ class CompilerAnalyzer:
 
                 # Compile
                 compile_proc = subprocess.run(
-                    [gxx_path, "-O2", src_file, "-o", exe_file],
+                    [gxx_path, *pch_flags(final_source, self.language), *(["-x", "c", "-std=c11"] if self.language == "c" else CPP_FLAGS), src_file, "-o", exe_file],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -911,6 +932,11 @@ class CompilerAnalyzer:
             "error": "",
             "execution_type": "fast_interpreter"
         }
+
+    def corrected_only(self) -> Tuple[str, List[str]]:
+        """What Fix All / Apply Fix need: no program execution, no extra passes."""
+        self.compiler_check()
+        return self.build_corrected_code()
 
     def get_results(self) -> Dict[str, Any]:
         # Verify with the real compiler before deciding what is an error

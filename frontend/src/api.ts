@@ -1,12 +1,4 @@
-import type {
-  AnalysisResponse,
-  AutocompleteResponse,
-  ExampleProgram,
-  FixAllResponse,
-  ExplainFixResponse,
-  DiagnosticItem,
-  SymbolItem,
-} from './types';
+import type { AnalysisResponse, AutocompleteResponse, ExampleProgram, FixAllResponse, ExplainFixResponse, DiagnosticItem, SymbolItem, FixDiagnosticResponse } from './types';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL 
   ? `${import.meta.env.VITE_API_BASE_URL.replace(/\/$/, '')}/api`
@@ -78,6 +70,20 @@ export const api = {
       }),
     });
     if (!res.ok) throw new Error('Explanation request failed');
+    return res.json();
+  },
+
+  async fixDiagnostic(
+    source: string,
+    language: string,
+    diagnostic: DiagnosticItem
+  ): Promise<FixDiagnosticResponse> {
+    const res = await fetch(`${API_BASE}/fix-diagnostic`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, language, diagnostic }),
+    });
+    if (!res.ok) throw new Error('Fix request failed');
     return res.json();
   },
 

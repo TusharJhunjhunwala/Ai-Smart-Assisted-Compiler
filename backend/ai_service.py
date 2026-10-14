@@ -76,190 +76,41 @@ class AIService:
         line: int,
         col: int,
         symbols: List[Dict[str, Any]],
-        functions: List[str]
+        functions: List[str],
+        language: str = "cpp"
     ) -> List[str]:
         """
         Fast, offline, contextual rule-based completion based on static analysis.
         Guarantees instant responses even if API key is not present or offline.
         """
         suggestions: List[str] = []
-        lines = prefix.splitlines()
+        lines = prefix.split("\n")
         current_line = lines[-1] if lines else ""
         trimmed = current_line.strip()
 
         var_names = [s["name"] for s in symbols]
         int_vars = [s["name"] for s in symbols if s.get("type") in ("int", "float")]
 
-        # Case 1: Function signature definition ending in '{' or newline after signature
-        # e.g., "void add() {" or "int sum(int a, int b) {" or "void add() {"
-        func_match = re.search(r"\b(void|int|float|char|bool|string)\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*\{?$", trimmed)
-        if func_match:
-            ret_type, func_name, params = func_match.groups()
-            brace_needed = "{" not in trimmed
-            prefix_brace = "{\n" if brace_needed else "\n"
-            indent = "    "
-            
-            # Predict body based on function name & return type
-            fn_lower = func_name.lower()
-            
-            # Helper for parameter extraction
-            p_names = [p.strip().split()[-1] for p in params.split(",") if p.strip()] if params and params.strip() != "void" else []
-            
-            # Operation 1: Addition / Sum
-            if "add" in fn_lower or "sum" in fn_lower:
-                if len(p_names) >= 2:
-                    body1 = f"{indent}int result = {p_names[0]} + {p_names[1]};\n{indent}return result;\n}}" if ret_type != "void" else f"{indent}int result = {p_names[0]} + {p_names[1]};\n{indent}cout << result << endl;\n{indent}return;\n}}"
-                    body2 = f"{indent}return {p_names[0]} + {p_names[1]};\n}}" if ret_type != "void" else f"{indent}cout << ({p_names[0]} + {p_names[1]}) << endl;\n{indent}return;\n}}"
-                    suggestions.append(f"{prefix_brace}{body1}")
-                    suggestions.append(f"{prefix_brace}{body2}")
+        # Case 1: a function header -> write its body.
+        #   (a) cursor right after "int gcd(int a, int b) {"   (b) cursor on the blank line below it
+        header_line, on_blank_line = trimmed, False
+        if not trimmed and len(lines) >= 2 and lines[-2].rstrip().endswith("{"):
+            header_line, on_blank_line = lines[-2].strip(), True
+        func_match = re.search(r"^(?:static\s+|inline\s+)?(void|int|float|double|char|bool|string|long)\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*(\{?)$", header_line)
+        if func_match and func_match.group(2) != "main":
+            ret_type, func_name, params, brace = func_match.groups()
+            header_src = lines[-2] if on_blank_line else current_line
+            base = re.match(r"\s*", header_src).group(0)
+            inner = base + "    "
+            bodies = self._function_bodies(ret_type, func_name, params, language)
+            for body in bodies:
+                body_lines = [inner + l if l else "" for l in body]
+                if on_blank_line:
+                    # the cursor is already indented on the first body line
+                    text = body_lines[0].lstrip() + "".join("\n" + l for l in body_lines[1:]) + "\n" + base + "}"
                 else:
-                    if ret_type == "void":
-                        body1 = f"{indent}int a = 10;\n{indent}int b = 20;\n{indent}int sum = a + b;\n{indent}cout << sum << endl;\n{indent}return;\n}}"
-                        body2 = f"{indent}int a = 10;\n{indent}int b = 20;\n{indent}cout << (a + b) << endl;\n{indent}return;\n}}"
-                        suggestions.append(f"{prefix_brace}{body1}")
-                        suggestions.append(f"{prefix_brace}{body2}")
-                    else:
-                        body1 = f"{indent}int a = 10;\n{indent}int b = 20;\n{indent}int result = a + b;\n{indent}return result;\n}}"
-                        body2 = f"{indent}int a = 10;\n{indent}int b = 20;\n{indent}return a + b;\n}}"
-                        suggestions.append(f"{prefix_brace}{body1}")
-                        suggestions.append(f"{prefix_brace}{body2}")
-                return suggestions
-            
-            # Operation 2: Subtraction / Difference
-            elif "sub" in fn_lower or "diff" in fn_lower or "minus" in fn_lower:
-                if len(p_names) >= 2:
-                    body = f"{indent}int result = {p_names[0]} - {p_names[1]};\n{indent}return result;\n}}" if ret_type != "void" else f"{indent}int result = {p_names[0]} - {p_names[1]};\n{indent}cout << result << endl;\n{indent}return;\n}}"
-                else:
-                    body = f"{indent}int a = 30;\n{indent}int b = 10;\n{indent}int diff = a - b;\n{indent}return diff;\n}}" if ret_type != "void" else f"{indent}int a = 30;\n{indent}int b = 10;\n{indent}int diff = a - b;\n{indent}cout << diff << endl;\n{indent}return;\n}}"
-            
-            # Operation 3: Multiplication / Product
-            elif "mult" in fn_lower or "prod" in fn_lower:
-                if len(p_names) >= 2:
-                    body = f"{indent}int result = {p_names[0]} * {p_names[1]};\n{indent}return result;\n}}" if ret_type != "void" else f"{indent}int result = {p_names[0]} * {p_names[1]};\n{indent}cout << result << endl;\n{indent}return;\n}}"
-                else:
-                    body = f"{indent}int a = 5;\n{indent}int b = 4;\n{indent}return a * b;\n}}" if ret_type != "void" else f"{indent}int a = 5;\n{indent}int b = 4;\n{indent}int prod = a * b;\n{indent}cout << prod << endl;\n{indent}return;\n}}"
-            
-            # Operation 4: Division / Quotient
-            elif "div" in fn_lower or "quot" in fn_lower:
-                if len(p_names) >= 2:
-                    body1 = f"{indent}if ({p_names[1]} == 0) return 0;\n{indent}return {p_names[0]} / {p_names[1]};\n}}"
-                    body2 = f"{indent}return ({p_names[1]} != 0) ? ({p_names[0]} / {p_names[1]}) : 0;\n}}"
-                    suggestions.append(f"{prefix_brace}{body1}")
-                    suggestions.append(f"{prefix_brace}{body2}")
-                else:
-                    body = f"{indent}int a = 100;\n{indent}int b = 5;\n{indent}return a / b;\n}}"
-                    suggestions.append(f"{prefix_brace}{body}")
-
-            # Operation 5: Modulo / Remainder
-            elif "mod" in fn_lower or "rem" in fn_lower:
-                if len(p_names) >= 2:
-                    suggestions.append(f"{prefix_brace}{indent}return {p_names[0]} % {p_names[1]};\n}}")
-                else:
-                    suggestions.append(f"{prefix_brace}{indent}int a = 17;\n{indent}int b = 5;\n{indent}return a % b;\n}}")
-
-            # Operation 6: Power / Exponent
-            elif "pow" in fn_lower or "power" in fn_lower:
-                if len(p_names) >= 2:
-                    body1 = f"{indent}int res = 1;\n{indent}for (int i = 0; i < {p_names[1]}; i++) {{\n{indent}    res = res * {p_names[0]};\n{indent}}}\n{indent}return res;\n}}"
-                    suggestions.append(f"{prefix_brace}{body1}")
-                else:
-                    suggestions.append(f"{prefix_brace}{indent}int base = 2;\n{indent}int exp = 3;\n{indent}int res = 1;\n{indent}for (int i = 0; i < exp; i++) res = res * base;\n{indent}return res;\n}}")
-
-            # Operation 7: GCD / HCF (Greatest Common Divisor)
-            elif "gcd" in fn_lower or "hcf" in fn_lower:
-                if len(p_names) >= 2:
-                    body1 = f"{indent}while ({p_names[1]} != 0) {{\n{indent}    int temp = {p_names[1]};\n{indent}    {p_names[1]} = {p_names[0]} % {p_names[1]};\n{indent}    {p_names[0]} = temp;\n{indent}}}\n{indent}return {p_names[0]};\n}}"
-                    body2 = f"{indent}if ({p_names[1]} == 0) return {p_names[0]};\n{indent}return gcd({p_names[1]}, {p_names[0]} % {p_names[1]});\n}}"
-                    suggestions.append(f"{prefix_brace}{body1}")
-                    suggestions.append(f"{prefix_brace}{body2}")
-                else:
-                    suggestions.append(f"{prefix_brace}{indent}int a = 48, b = 18;\n{indent}while (b != 0) {{\n{indent}    int t = b;\n{indent}    b = a % b;\n{indent}    a = t;\n{indent}}}\n{indent}return a;\n}}")
-
-            # Operation 8: Prime Number Check
-            elif "prime" in fn_lower:
-                arg = p_names[0] if p_names else "n"
-                body = f"{indent}if ({arg} <= 1) return false;\n{indent}for (int i = 2; i * i <= {arg}; i++) {{\n{indent}    if ({arg} % i == 0) return false;\n{indent}}}\n{indent}return true;\n}}"
-                suggestions.append(f"{prefix_brace}{body}")
-
-            # Operation 9: Fibonacci
-            elif "fib" in fn_lower:
-                arg = p_names[0] if p_names else "n"
-                body1 = f"{indent}if ({arg} <= 1) return {arg};\n{indent}int a = 0, b = 1, c = 0;\n{indent}for (int i = 2; i <= {arg}; i++) {{\n{indent}    c = a + b;\n{indent}    a = b;\n{indent}    b = c;\n{indent}}}\n{indent}return b;\n}}"
-                body2 = f"{indent}if ({arg} <= 1) return {arg};\n{indent}return fib({arg} - 1) + fib({arg} - 2);\n}}"
-                suggestions.append(f"{prefix_brace}{body1}")
-                suggestions.append(f"{prefix_brace}{body2}")
-
-            # Operation 10: Reverse Number / Digits
-            elif "reverse" in fn_lower:
-                arg = p_names[0] if p_names else "num"
-                body = f"{indent}int rev = 0;\n{indent}int n = {arg};\n{indent}while (n > 0) {{\n{indent}    rev = rev * 10 + (n % 10);\n{indent}    n = n / 10;\n{indent}}}\n{indent}return rev;\n}}"
-                suggestions.append(f"{prefix_brace}{body}")
-
-            # Operation 11: Square / Cube
-            elif "square" in fn_lower or "sqr" in fn_lower:
-                arg = p_names[0] if p_names else "n"
-                suggestions.append(f"{prefix_brace}{indent}return {arg} * {arg};\n}}")
-            elif "cube" in fn_lower:
-                arg = p_names[0] if p_names else "n"
-                suggestions.append(f"{prefix_brace}{indent}return {arg} * {arg} * {arg};\n}}")
-
-            # Operation 12: Max / Min
-            elif "max" in fn_lower:
-                if len(p_names) >= 2:
-                    suggestions.append(f"{prefix_brace}{indent}if ({p_names[0]} > {p_names[1]}) return {p_names[0]};\n{indent}return {p_names[1]};\n}}")
-                    suggestions.append(f"{prefix_brace}{indent}return ({p_names[0]} > {p_names[1]}) ? {p_names[0]} : {p_names[1]};\n}}")
-                else:
-                    suggestions.append(f"{prefix_brace}{indent}int a = 15;\n{indent}int b = 25;\n{indent}return (a > b) ? a : b;\n}}")
-            elif "min" in fn_lower:
-                if len(p_names) >= 2:
-                    suggestions.append(f"{prefix_brace}{indent}if ({p_names[0]} < {p_names[1]}) return {p_names[0]};\n{indent}return {p_names[1]};\n}}")
-                    suggestions.append(f"{prefix_brace}{indent}return ({p_names[0]} < {p_names[1]}) ? {p_names[0]} : {p_names[1]};\n}}")
-                else:
-                    suggestions.append(f"{prefix_brace}{indent}int a = 15;\n{indent}int b = 25;\n{indent}return (a < b) ? a : b;\n}}")
-
-            # Operation 13: Average / Mean
-            elif "avg" in fn_lower or "average" in fn_lower or "mean" in fn_lower:
-                if len(p_names) >= 2:
-                    suggestions.append(f"{prefix_brace}{indent}return ({p_names[0]} + {p_names[1]}) / 2;\n}}")
-                else:
-                    suggestions.append(f"{prefix_brace}{indent}int a = 10, b = 20;\n{indent}return (a + b) / 2;\n}}")
-
-            # Operation 14: Factorial
-            elif "fact" in fn_lower or "factorial" in fn_lower:
-                n_var = p_names[0] if p_names else "n"
-                body1 = f"{indent}int result = 1;\n{indent}for (int i = 1; i <= {n_var}; i++) {{\n{indent}    result = result * i;\n{indent}}}\n{indent}return result;\n}}"
-                body2 = f"{indent}if ({n_var} <= 1) return 1;\n{indent}return {n_var} * factorial({n_var} - 1);\n}}"
-                suggestions.append(f"{prefix_brace}{body1}")
-                suggestions.append(f"{prefix_brace}{body2}")
-
-            # Operation 15: Swap
-            elif "swap" in fn_lower:
-                suggestions.append(f"{prefix_brace}{indent}int temp = a;\n{indent}a = b;\n{indent}b = temp;\n{indent}return;\n}}")
-
-            # Operation 16: Even / Odd Check
-            elif "iseven" in fn_lower or "even" in fn_lower:
-                arg = p_names[0] if p_names else "n"
-                suggestions.append(f"{prefix_brace}{indent}return ({arg} % 2 == 0);\n}}")
-            elif "isodd" in fn_lower or "odd" in fn_lower:
-                arg = p_names[0] if p_names else "n"
-                suggestions.append(f"{prefix_brace}{indent}return ({arg} % 2 != 0);\n}}")
-
-            # Operation 17: Binary Search
-            elif "binarysearch" in fn_lower or "search" in fn_lower:
-                suggestions.append(f"{prefix_brace}{indent}int left = 0, right = n - 1;\n{indent}while (left <= right) {{\n{indent}    int mid = left + (right - left) / 2;\n{indent}    if (arr[mid] == target) return mid;\n{indent}    if (arr[mid] < target) left = mid + 1;\n{indent}    else right = mid - 1;\n{indent}}}\n{indent}return -1;\n}}")
-
-            # Default fallbacks based on return type
-            elif ret_type == "int":
-                suggestions.append(f"{prefix_brace}{indent}int result = 0;\n{indent}return result;\n}}")
-                suggestions.append(f"{prefix_brace}{indent}return 0;\n}}")
-            elif ret_type == "bool":
-                suggestions.append(f"{prefix_brace}{indent}return true;\n}}")
-                suggestions.append(f"{prefix_brace}{indent}return false;\n}}")
-            elif ret_type == "void":
-                suggestions.append(f"{prefix_brace}{indent}cout << \"Executing...\" << endl;\n{indent}return;\n}}")
-            else:
-                suggestions.append(f"{prefix_brace}{indent}return 0;\n}}")
-
+                    text = ("" if brace else " {") + "\n" + "\n".join(body_lines) + "\n" + base + "}"
+                suggestions.append(self._balance_braces(text, prefix, suffix))
             return suggestions
 
         # Case 2: #include completions
@@ -443,6 +294,216 @@ class AIService:
 
         return suggestions
 
+    # ------------------------------------------------------------------ bodies
+    @staticmethod
+    def _name_words(name: str) -> List[str]:
+        """isPrimeNumber -> [is, prime, number];  find_max -> [find, max]"""
+        return [w.lower() for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", name.replace("_", " "))]
+
+    @staticmethod
+    def _balance_braces(text: str, prefix: str, suffix: str) -> str:
+        """
+        Editors auto-insert the closing '}' when '{' is typed. If the document already
+        has it, drop the suggestion's own closing brace so accepting never adds an extra '}'.
+        """
+        from autofix import split_code
+        def net(code: str) -> int:
+            total, in_block = 0, False
+            for ln in code.split("\n"):
+                masked, _, in_block, _ = split_code(ln, in_block)
+                total += masked.count("{") - masked.count("}")
+            return total
+        # Closers right after the cursor on the same line ({|} or (|)) are replaced on accept
+        rest_line = suffix.split("\n", 1)[0]
+        if re.fullmatch(r"\s*[)\]}]+;?\s*", rest_line):
+            suffix = suffix[len(rest_line):]
+        doc, extra = net(prefix + suffix), net(text)
+        while doc + extra < 0 and text.rstrip().endswith("}"):
+            text = text.rstrip()[:-1].rstrip(" \t")
+            text = text[:-1] if text.endswith("\n") else text
+            extra += 1
+        return text
+
+    def _function_bodies(self, ret: str, name: str, params: str, language: str = "cpp") -> List[List[str]]:
+        """
+        Bodies for common functions, written with the function's real parameter names.
+        Never uses a variable that does not exist: without parameters, it declares sample inputs.
+        """
+        words, low = self._name_words(name), name.lower()
+
+        def has(keys, prefixes=()):
+            return low in keys or any(w in keys for w in words) or any(w.startswith(p) for w in words for p in prefixes)
+
+        plist = [p.strip() for p in params.split(",") if p.strip() and p.strip() != "void"]
+        all_names = [re.sub(r"\[.*\]", "", p).replace("&", " ").replace("*", " ").split()[-1] for p in plist]
+        # numbers only: arrays and pointers are not used as plain values
+        scalar = [(p, n) for p, n in zip(plist, all_names) if "[" not in p and "*" not in p]
+        names = [n for _, n in scalar]
+        floating = {n for p, n in scalar if re.search(r"\b(double|float)\b", p)}
+
+        def iv(x: str) -> str:
+            """% and digit loops need integers"""
+            return f"(int){x}" if x in floating else x
+
+        def loc(x: str) -> str:
+            """a local that does not clash with a parameter name"""
+            while x in all_names:
+                x = x + "_"
+            return x
+        is_bool, is_void = ret == "bool", ret == "void"
+        real = ret in ("double", "float")
+
+        def inputs(count: int, samples=("a", "b"), values=("10", "20")):
+            """Use the parameters; declare sample values only for the ones that are missing."""
+            got = names[:count]
+            decl = []
+            for i in range(len(got), count):
+                got.append(samples[i])
+                decl.append(f"int {samples[i]} = {values[i]};")
+            return got, decl
+
+        def out(expr: str) -> List[str]:
+            if not is_void:
+                return [f"return {expr};"]
+            shown = expr if re.fullmatch(r"[A-Za-z_]\w*", expr) else f"({expr})"
+            if language == "c":
+                return [f'printf("%d\\n", {expr});']
+            return [f"cout << {shown} << endl;"]
+
+        def truth(value: bool) -> str:
+            return ("true" if value else "false") if (is_bool or language == "cpp") else ("1" if value else "0")
+
+        bodies: List[List[str]] = []
+        if has({"add", "addition", "sum", "plus", "total"}):
+            (a, b), d = inputs(2)
+            r = loc("result")
+            bodies = [d + [f"{'double' if floating else 'int'} {r} = {a} + {b};"] + out(r), d + out(f"{a} + {b}")]
+        elif has({"sub", "subtract", "subtraction", "diff", "difference", "minus"}):
+            (a, b), d = inputs(2, values=("30", "10"))
+            r = loc("result")
+            bodies = [d + [f"{'double' if floating else 'int'} {r} = {a} - {b};"] + out(r), d + out(f"{a} - {b}")]
+        elif has({"mul", "mult", "multiply", "multiplication", "product", "prod", "times"}):
+            (a, b), d = inputs(2, values=("5", "4"))
+            r = loc("result")
+            bodies = [d + [f"{'double' if floating else 'int'} {r} = {a} * {b};"] + out(r), d + out(f"{a} * {b}")]
+        elif has({"div", "divide", "division", "quotient", "quot"}):
+            (a, b), d = inputs(2, values=("100", "5"))
+            zero = "0.0" if real else "0"
+            bodies = [d + [f"if ({b} == 0) {{", f"    return {zero};" if not is_void else "    return;", "}"] + out(f"{a} / {b}"),
+                      d + out(f"({b} != 0) ? ({a} / {b}) : {zero}")]
+        elif has({"mod", "modulo", "modulus", "remainder", "rem"}):
+            (a, b), d = inputs(2, values=("17", "5"))
+            bodies = [d + out(f"{iv(a)} % {iv(b)}")]
+        elif has({"pow", "power", "exponent", "exp"}):
+            (a, b), d = inputs(2, samples=("base", "exponent"), values=("2", "3"))
+            r, i = loc("result"), loc("i")
+            bodies = [d + [f"{'double' if a in floating else 'int'} {r} = 1;", f"for (int {i} = 0; {i} < {b}; {i}++) {{",
+                           f"    {r} = {r} * {a};", "}"] + out(r)]
+        elif has({"gcd", "hcf"}):
+            (a, b), d = inputs(2, values=("48", "18"))
+            x, y, t = loc("x"), loc("y"), loc("temp")
+            loop = d + [f"int {x} = {iv(a)}, {y} = {iv(b)};", f"while ({y} != 0) {{", f"    int {t} = {y};",
+                        f"    {y} = {x} % {y};", f"    {x} = {t};", "}"] + out(x)
+            bodies = [loop]
+            if names[:2] == [a, b] and len(all_names) == 2 and not floating and not is_void:
+                bodies.append([f"if ({b} == 0) return {a};", f"return {name}({b}, {a} % {b});"])
+        elif has({"prime"}, ("prime",)):
+            (n,), d = inputs(1, samples=("n",), values=("7",))
+            n, i, pr = iv(n), loc("i"), loc("isPrime")
+            if is_void:
+                bodies = [d + [f"bool {pr} = {n} > 1;", f"for (int {i} = 2; {i} * {i} <= {n}; {i}++) {{",
+                               f"    if ({n} % {i} == 0) {{", f"        {pr} = false;", "        break;", "    }", "}"]
+                          + ([f'printf("%s\\n", {pr} ? "Prime" : "Not prime");'] if language == "c"
+                             else [f'cout << ({pr} ? "Prime" : "Not prime") << endl;'])]
+            else:
+                bodies = [d + [f"if ({n} <= 1) return {truth(False)};", f"for (int {i} = 2; {i} * {i} <= {n}; {i}++) {{",
+                               f"    if ({n} % {i} == 0) return {truth(False)};", "}", f"return {truth(True)};"]]
+        elif has({"fib", "fibo", "fibonacci"}, ("fib",)):
+            (n,), d = inputs(1, samples=("n",), values=("10",))
+            n = iv(n)
+            pv, cu, nx, i = loc("prev"), loc("curr"), loc("next"), loc("i")
+            loop = d + [f"if ({n} <= 1) " + (f"return {n};" if not is_void else f"{{ cout << {n} << endl; return; }}"),
+                        f"int {pv} = 0, {cu} = 1;", f"for (int {i} = 2; {i} <= {n}; {i}++) {{", f"    int {nx} = {pv} + {cu};",
+                        f"    {pv} = {cu};", f"    {cu} = {nx};", "}"] + out(cu)
+            bodies = [loop]
+            if len(all_names) == 1 and names and not floating and not is_void:
+                bodies.append([f"if ({n} <= 1) return {n};", f"return {name}({n} - 1) + {name}({n} - 2);"])
+        elif has({"reverse", "rev"}, ("revers",)):
+            (n,), d = inputs(1, samples=("num",), values=("1234",))
+            rv, m = loc("rev"), loc("rest")
+            bodies = [d + [f"int {rv} = 0;", f"int {m} = {iv(n)};", f"while ({m} > 0) {{",
+                           f"    {rv} = {rv} * 10 + {m} % 10;", f"    {m} = {m} / 10;", "}"] + out(rv)]
+            bodies = [[l for l in b if l] for b in bodies]
+        elif has({"square", "sqr", "sq"}):
+            (n,), d = inputs(1, samples=("n",), values=("5",))
+            bodies = [d + out(f"{n} * {n}")]
+        elif has({"cube"}):
+            (n,), d = inputs(1, samples=("n",), values=("3",))
+            bodies = [d + out(f"{n} * {n} * {n}")]
+        elif has({"max", "maximum", "largest", "greatest", "biggest"}):
+            (a, b), d = inputs(2, values=("15", "25"))
+            bodies = [d + [f"if ({a} > {b}) " + (f"return {a};" if not is_void else f"{{ cout << {a} << endl; return; }}")] + out(b),
+                      d + out(f"({a} > {b}) ? {a} : {b}")]
+        elif has({"min", "minimum", "smallest", "least"}):
+            (a, b), d = inputs(2, values=("15", "25"))
+            bodies = [d + [f"if ({a} < {b}) " + (f"return {a};" if not is_void else f"{{ cout << {a} << endl; return; }}")] + out(b),
+                      d + out(f"({a} < {b}) ? {a} : {b}")]
+        elif has({"avg", "average", "mean"}):
+            (a, b), d = inputs(2)
+            bodies = [d + out(f"({a} + {b}) / " + ("2.0" if real or is_void else "2"))]
+        elif has({"fact", "factorial"}, ("fact",)):
+            (n,), d = inputs(1, samples=("n",), values=("5",))
+            r, i = loc("result"), loc("i")
+            loop = d + [f"long long {r} = 1;", f"for (int {i} = 2; {i} <= {iv(n)}; {i}++) {{", f"    {r} = {r} * {i};", "}"] + out(r)
+            bodies = [loop]
+            if len(all_names) == 1 and names and not floating and not is_void:
+                bodies.append([f"if ({n} <= 1) return 1;", f"return {n} * {name}({n} - 1);"])
+        elif has({"swap"}):
+            (a, b), d = inputs(2, values=("1", "2"))
+            t = loc("temp")
+            body = d + [f"{'double' if a in floating else 'int'} {t} = {a};", f"{a} = {b};", f"{b} = {t};"]
+            if d or is_void and not all("&" in p or "*" in p for p in plist[:2]):
+                # by-value parameters cannot swap the caller's variables: show the result
+                body += [f'cout << {a} << " " << {b} << endl;'] if language == "cpp" else [f'printf("%d %d\\n", {a}, {b});']
+            bodies = [body]
+        elif has({"even"}, ("even",)):
+            (n,), d = inputs(1, samples=("n",), values=("4",))
+            bodies = [d + out(f"{iv(n)} % 2 == 0")]
+        elif has({"odd"}, ("odd",)):
+            (n,), d = inputs(1, samples=("n",), values=("7",))
+            bodies = [d + out(f"{iv(n)} % 2 != 0")]
+        elif has({"search", "bsearch", "binarysearch"}, ("search",)):
+            arrays = [n for p, n in zip(plist, all_names) if "[" in p or "*" in p]
+            if arrays and len(names) >= 2:
+                arr, (n, target) = arrays[0], names[:2]
+                prelude = []
+            else:
+                arr, n, target = "arr", "n", "target"
+                prelude = ["int arr[] = {2, 4, 6, 8, 10};", "int n = 5;", "int target = 8;"]
+            lo, hi, mid = loc("left"), loc("right"), loc("mid")
+            bodies = [prelude + [f"int {lo} = 0, {hi} = {n} - 1;", f"while ({lo} <= {hi}) {{",
+                                 f"    int {mid} = {lo} + ({hi} - {lo}) / 2;", f"    if ({arr}[{mid}] == {target}) return {mid};",
+                                 f"    if ({arr}[{mid}] < {target}) {lo} = {mid} + 1;", f"    else {hi} = {mid} - 1;", "}",
+                                 "return -1;"]]
+            if is_void:
+                bodies = [[l.replace(f"return {mid};", f"{{ cout << {mid} << endl; return; }}").replace("return -1;", "cout << -1 << endl;")
+                           for l in bodies[0]]]
+            elif ret in ("bool",):
+                bodies = [[l.replace(f"return {mid};", "return true;").replace("return -1;", "return false;") for l in bodies[0]]]
+        if bodies:
+            return bodies
+        # Fallbacks by return type
+        if ret == "bool":
+            return [["return true;"], ["return false;"]]
+        if ret == "void":
+            return [['cout << "Executing ' + name + '..." << endl;'] if language == "cpp"
+                    else ['printf("Executing ' + name + '...\\n");']]
+        if ret == "string":
+            return [['return "";']]
+        if ret in ("double", "float"):
+            return [["return 0.0;"]]
+        return [["int result = 0;", "return result;"], ["return 0;"]]
+
     def get_predictive_completion(
         self,
         prefix: str,
@@ -457,7 +518,7 @@ class AIService:
         functions = functions or []
 
         # 1. First get rule-based completions (instant, zero-latency)
-        rule_suggestions = self.rule_based_autocomplete(prefix, suffix, line, col, symbols, functions)
+        rule_suggestions = self.rule_based_autocomplete(prefix, suffix, line, col, symbols, functions, language)
 
         # 2. If API Key is configured, attempt intelligent LLM completion
         ai_suggestion = None

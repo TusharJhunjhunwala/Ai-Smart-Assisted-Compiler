@@ -19,6 +19,7 @@ export interface DiagnosticItem {
   message: string;
   suggestion?: string;
   replacement?: string;
+  source?: 'analyzer' | 'structure' | 'compiler';
 }
 
 export interface CompilationSummary {
@@ -43,6 +44,7 @@ export interface AnalysisResponse {
   diagnostics: DiagnosticItem[];
   optimizations: string[];
   corrected_code: string;
+  fixes?: string[];
   execution?: ExecutionResult;
   summary: CompilationSummary;
 }
@@ -66,6 +68,13 @@ export interface FixAllResponse {
   corrected_code: string;
   diff: string;
   fixed_count: number;
+  fixes?: string[];
+}
+
+export interface FixDiagnosticResponse {
+  fixed_code: string;
+  applied: boolean;
+  message: string;
 }
 
 export interface ExplainFixResponse {

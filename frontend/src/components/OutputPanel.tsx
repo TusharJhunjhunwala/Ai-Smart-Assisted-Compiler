@@ -18,6 +18,7 @@ import {
 interface OutputPanelProps {
   data: AnalysisResponse | null;
   onApplyFix: (diag: DiagnosticItem) => void;
+  fixingLine?: number | null;
   onExplainDiag: (diag: DiagnosticItem) => void;
   onApplyCorrectedCode: (code: string) => void;
 }
@@ -25,6 +26,7 @@ interface OutputPanelProps {
 export const OutputPanel: React.FC<OutputPanelProps> = ({
   data,
   onApplyFix,
+  fixingLine,
   onExplainDiag,
   onApplyCorrectedCode,
 }) => {
@@ -258,16 +260,15 @@ export const OutputPanel: React.FC<OutputPanelProps> = ({
                             <HelpCircle className="w-3 h-3 text-cyan-400" />
                             <span>Explain</span>
                           </button>
-                          {diag.suggestion && (
-                            <button
-                              onClick={() => onApplyFix(diag)}
-                              className="px-2 py-0.8 rounded bg-indigo-600 hover:bg-indigo-500 text-white flex items-center space-x-1 transition cursor-pointer"
-                              title="Apply fix to code"
-                            >
-                              <Wand2 className="w-3 h-3" />
-                              <span>Apply Fix</span>
-                            </button>
-                          )}
+                          <button
+                            onClick={() => onApplyFix(diag)}
+                            disabled={fixingLine != null}
+                            className="px-2 py-0.8 rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 disabled:cursor-wait text-white flex items-center space-x-1 transition cursor-pointer"
+                            title="Fix only this problem"
+                          >
+                            <Wand2 className={`w-3 h-3 ${fixingLine === diag.line ? 'animate-spin' : ''}`} />
+                            <span>{fixingLine === diag.line ? 'Fixing...' : 'Apply Fix'}</span>
+                          </button>
                         </div>
                       </div>
 

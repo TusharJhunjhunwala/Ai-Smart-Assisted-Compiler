@@ -19,6 +19,31 @@ interface CodeEditorProps {
   setActiveGhostText: (t: string | null) => void;
 }
 
+// Closing brackets in `text` that have no opening bracket inside `text` itself
+// (string and character literals are skipped).
+function unmatchedClosers(text: string): Record<')' | ']' | '}', number> {
+  const pairs: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
+  const depth: Record<string, number> = { '(': 0, '[': 0, '{': 0 };
+  const unmatched = { ')': 0, ']': 0, '}': 0 };
+  let quote: string | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch in depth) depth[ch]++;
+    else if (ch in pairs) {
+      const open = pairs[ch];
+      if (depth[open] > 0) depth[open]--;
+      else unmatched[ch as ')' | ']' | '}']++;
+    }
+  }
+  return unmatched;
+}
+
 export const CodeEditor: React.FC<CodeEditorProps> = ({
   code,
   onChange,
@@ -35,6 +60,9 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const monacoRef = useRef<Monaco | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const debounceTimerRef = useRef<any>(null);
+  // Values this editor itself produced. A re-render that passes one of them back is just an
+  // echo of the user's typing and must never overwrite the editor (that moved the cursor).
+  const emittedRef = useRef<string[]>([code]);
 
   // Suggestions history & cycling
   const [suggestionList, setSuggestionList] = useState<string[]>([]);
@@ -66,14 +94,30 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     const position = editor.getPosition();
     if (!position) return false;
 
-    // Insert the text directly at cursor position
+    // The editor auto-inserts closing brackets ({|} or (|)). If the suggestion already
+    // contains them, replace the auto-inserted ones so accepting never adds an extra '}'.
+    let endColumn = position.column;
+    const model = editor.getModel();
+    if (model) {
+      const lineText = model.getLineContent(position.lineNumber);
+      const rest = lineText.slice(position.column - 1);
+      if (/^\s*[)\]}]+;?\s*$/.test(rest)) {
+        const unmatched = unmatchedClosers(textToInsert);
+        const closers = [')', ']', '}'] as const;
+        const needed = closers.map((c) => rest.split(c).length - 1);
+        if (needed.some((n) => n > 0) && closers.every((c, i) => unmatched[c] >= needed[i])) {
+          endColumn = lineText.length + 1;
+        }
+      }
+    }
+
     editor.executeEdits('ai-ghost-text', [
       {
         range: new monacoRef.current.Range(
           position.lineNumber,
           position.column,
           position.lineNumber,
-          position.column
+          endColumn
         ),
         text: textToInsert,
         forceMoveMarkers: true,
@@ -192,6 +236,16 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     });
   };
 
+  // Apply changes that come from outside the editor (Apply Fix, Fix All, demos, Clear)
+  useEffect(() => {
+    const ed = editorRef.current;
+    if (!ed) return;
+    const model = ed.getModel();
+    if (!model || model.getValue() === code || emittedRef.current.includes(code)) return;
+    ed.executeEdits('external-update', [{ range: model.getFullModelRange(), text: code, forceMoveMarkers: true }]);
+    ed.pushUndoStop();
+  }, [code]);
+
   // Trigger Debounced Autocomplete
   const triggerAutocomplete = (updatedCode?: string) => {
     if (!aiEnabled || !editorRef.current) {
@@ -290,9 +344,11 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           height="100%"
           language={language === 'c' ? 'c' : 'cpp'}
           theme={theme === 'dark' ? 'vs-dark' : 'light'}
-          value={code}
+          defaultValue={code}
           onChange={(val) => {
             const nextVal = val || '';
+            emittedRef.current.push(nextVal);
+            if (emittedRef.current.length > 100) emittedRef.current.shift();
             onChange(nextVal);
             triggerAutocomplete(nextVal);
           }}

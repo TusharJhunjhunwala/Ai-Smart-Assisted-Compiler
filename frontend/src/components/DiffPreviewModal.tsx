@@ -6,6 +6,7 @@ interface DiffPreviewModalProps {
   isOpen: boolean;
   onClose: () => void;
   data: FixAllResponse | null;
+  loading?: boolean;
   onAccept: (code: string) => void;
 }
 
@@ -13,9 +14,48 @@ export const DiffPreviewModal: React.FC<DiffPreviewModalProps> = ({
   isOpen,
   onClose,
   data,
+  loading,
   onAccept,
 }) => {
-  if (!isOpen || !data) return null;
+  if (!isOpen) return null;
+
+  // Opens instantly; shows progress until the compiler has finished checking the fix
+  if (!data) {
+    return (
+      <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="bg-slate-900 border border-slate-700/80 rounded-xl max-w-md w-full p-6 shadow-2xl flex items-center space-x-3">
+          <Sparkles className="w-5 h-5 text-amber-300 animate-spin" />
+          <div className="flex-1">
+            <p className="text-sm font-semibold text-slate-100">
+              {loading ? 'Fixing your code...' : 'Preparing fixes...'}
+            </p>
+            <p className="text-[11px] text-slate-400">Repairing every error and re-checking it with the compiler.</p>
+          </div>
+          <button onClick={onClose} className="p-1 rounded text-slate-400 hover:text-slate-200 hover:bg-slate-800 cursor-pointer">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (data.corrected_code === data.original_code) {
+    return (
+      <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="bg-slate-900 border border-slate-700/80 rounded-xl max-w-md w-full p-6 shadow-2xl">
+          <div className="flex items-center space-x-2 text-emerald-300">
+            <ShieldCheck className="w-5 h-5" />
+            <p className="text-sm font-semibold">Nothing to fix - the compiler accepts this code.</p>
+          </div>
+          <div className="mt-4 flex justify-end">
+            <button onClick={onClose} className="px-3 py-1.5 rounded-md text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 cursor-pointer">
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-150">
@@ -65,6 +105,20 @@ export const DiffPreviewModal: React.FC<DiffPreviewModalProps> = ({
             </pre>
           </div>
         </div>
+
+        {/* What was fixed, in plain words */}
+        {data.fixes && data.fixes.length > 0 && (
+          <div className="px-5 pb-3">
+            <div className="text-[11px] bg-slate-950/60 p-2.5 rounded border border-slate-800">
+              <p className="font-medium text-slate-300 mb-1">What was fixed ({data.fixes.length})</p>
+              <ul className="list-disc pl-4 space-y-0.5 text-slate-400 max-h-28 overflow-y-auto">
+                {data.fixes.map((f, i) => (
+                  <li key={i}>{f}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
 
         {/* Unified Diff Log (optional view) */}
         {data.diff && (
