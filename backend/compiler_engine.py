@@ -8,6 +8,7 @@ from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple, Any
 
 from autofix import AutoFixer, split_code, pch_flags, CPP_FLAGS
+from optimizer import optimize, metrics
 
 KEYWORDS = {
     "int", "float", "char", "double", "void", "return", "if", "else", "while", "for",
@@ -44,6 +45,70 @@ USING_STD = re.compile(r"^\s*using\s+namespace\s+std\s*;")
 UNQUALIFIED_STD = re.compile(r"(?<!::)(?<!::\s)\b(cout|cin|cerr|endl|string)\b")
 IOSTREAM_NAMES = re.compile(r"\b(cout|cin|cerr|endl)\b")
 PRINTF_CALL = re.compile(r"\b(printf|scanf|puts)\s*\(")
+
+
+
+def build_executable_source(code: str, language: str = "cpp") -> str:
+    """The exact program that gets compiled: snippets are wrapped in main() with the usual headers."""
+    has_main = bool(re.search(r"\b(int|void)\s+main\s*\(", code))
+    has_include = "#include" in code
+    has_namespace = "using namespace std;" in code
+    full = []
+    if language == "c":
+        if not has_include:
+            full.append("#include <stdio.h>")
+    else:
+        if not has_include:
+            full.append("#include <iostream>")
+            full.append("#include <cstdio>")
+        if not has_namespace:
+            full.append("using namespace std;")
+    if not has_main:
+        # keep directives and 'using' at file scope; everything else goes inside main()
+        body = []
+        for line in code.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith("using "):
+                full.append(line)
+            else:
+                body.append(line)
+        full.append("int main() {")
+        full.extend("    " + line for line in body)
+        full.append("    return 0;")
+        full.append("}")
+    else:
+        full.append(code)
+    return "\n".join(full)
+
+
+def run_program(code: str, language: str = "cpp", stdin: str = "", timeout: float = 4) -> Dict[str, Any]:
+    """Compile and run with g++/gcc. status: ok | compile_error | timeout | no_compiler | internal_error"""
+    compiler = AutoFixer.find_compiler()
+    if not compiler:
+        return {"status": "no_compiler", "stdout": "", "stderr": "", "returncode": None}
+    source = build_executable_source(code, language)
+    temp_dir = tempfile.mkdtemp(prefix="smart_compiler_")
+    src_file = os.path.join(temp_dir, "program.c" if language == "c" else "program.cpp")
+    exe_file = os.path.join(temp_dir, "program.exe" if os.name == "nt" else "program.out")
+    try:
+        with open(src_file, "w", encoding="utf-8") as f:
+            f.write(source)
+        lang_flags = ["-x", "c", "-std=c11"] if language == "c" else CPP_FLAGS
+        proc = subprocess.run([compiler, *pch_flags(source, language), *lang_flags, src_file, "-o", exe_file],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+        if proc.returncode != 0:
+            return {"status": "compile_error", "stdout": "", "stderr": proc.stderr, "returncode": None}
+        try:
+            run = subprocess.run([exe_file], input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            return {"status": "timeout", "stdout": out, "stderr": "", "returncode": None}
+        return {"status": "ok", "stdout": run.stdout, "stderr": run.stderr, "returncode": run.returncode}
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
+        return {"status": "internal_error", "stdout": "", "stderr": str(exc), "returncode": None}
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # Compiler warnings that are almost always real bugs (and that Fix All repairs)
@@ -91,7 +156,8 @@ class CompilerAnalyzer:
         self.functions: Dict[str, Dict[str, Any]] = {}
         self.known_constants: Dict[str, str] = {}
         self.allow_guess_fixes = True  # rename typos / auto-declare variables in Corrected Code
-        self.compiles_clean: Optional[bool] = None  # set by compiler_check() when g++/gcc is available
+        self.compiles_clean: Optional[bool] = None
+        self.last_run: Optional[Dict[str, Any]] = None  # raw result of the last real run  # set by compiler_check() when g++/gcc is available
         self.expression_cache: Dict[str, Tuple[str, int]] = {}
         self.auto_declarations: Dict[str, int] = {}
         self.toplevel_statements: List[Tuple[int, str]] = []
@@ -822,113 +888,24 @@ class CompilerAnalyzer:
                 "execution_type": "static_check"
             }
 
-        # Locate g++ compiler on system
-        gxx_path = shutil.which("g++")
-        if not gxx_path:
-            for candidate in [
-                r"C:\msys64\ucrt64\bin\g++.exe",
-                r"C:\MinGW\bin\g++.exe",
-                r"C:\msys64\mingw64\bin\g++.exe",
-                "/usr/bin/g++"
-            ]:
-                if os.path.exists(candidate):
-                    gxx_path = candidate
-                    break
-
-        # Prepare executable code snippet
-        raw_code = self.source
-        executable_code = raw_code
-
-        has_main = bool(re.search(r"\b(int|void)\s+main\s*\(", executable_code))
-        has_include = "#include" in executable_code
-        has_namespace = "using namespace std;" in executable_code
-
-        full_cpp = []
-        if self.language == "c":
-            if not has_include:
-                full_cpp.append("#include <stdio.h>")
-        else:
-            if not has_include:
-                full_cpp.append("#include <iostream>")
-                full_cpp.append("#include <cstdio>")
-            if not has_namespace:
-                full_cpp.append("using namespace std;")
-
-        if not has_main:
-            # Wrap standalone top-level statements inside main(), but keep
-            # preprocessor directives and 'using' declarations at file scope -
-            # putting '#include <iostream>' inside main() breaks the std headers.
-            body = []
-            for line in executable_code.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("#") or stripped.startswith("using "):
-                    full_cpp.append(line)
-                else:
-                    body.append(line)
-            full_cpp.append("int main() {")
-            for line in body:
-                full_cpp.append("    " + line)
-            full_cpp.append("    return 0;")
-            full_cpp.append("}")
-        else:
-            full_cpp.append(executable_code)
-
-        final_source = "\n".join(full_cpp)
-
-        # 1. Try native compilation if g++ is present
+        gxx_path = AutoFixer.find_compiler()
         if gxx_path:
-            temp_dir = tempfile.mkdtemp(prefix="smart_compiler_")
-            src_file = os.path.join(temp_dir, "program.cpp")
-            exe_file = os.path.join(temp_dir, "program.exe" if os.name == "nt" else "program.out")
-
-            try:
-                with open(src_file, "w", encoding="utf-8") as f:
-                    f.write(final_source)
-
-                # Compile
-                compile_proc = subprocess.run(
-                    [gxx_path, *pch_flags(final_source, self.language), *(["-x", "c", "-std=c11"] if self.language == "c" else CPP_FLAGS), src_file, "-o", exe_file],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=5
-                )
-
-                if compile_proc.returncode != 0:
-                    return {
-                        "success": False,
-                        "output": "",
-                        "error": compile_proc.stderr,
-                        "execution_type": "native_g++"
-                    }
-
-                # Run executable
-                run_proc = subprocess.run(
-                    [exe_file],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=4
-                )
-
+            run = run_program(self.source, self.language)
+            self.last_run = run
+            if run["status"] == "compile_error":
+                return {"success": False, "output": "", "error": run["stderr"], "execution_type": "native_g++"}
+            if run["status"] == "timeout":
+                return {"success": False, "output": run["stdout"],
+                        "error": "Execution timed out (infinite loop or process exceeded 4 seconds limit).",
+                        "execution_type": "native_g++"}
+            if run["status"] == "ok":
                 return {
-                    "success": run_proc.returncode == 0,
-                    "output": run_proc.stdout if run_proc.stdout else "(Program exited successfully with code 0)",
-                    "error": run_proc.stderr,
+                    "success": run["returncode"] == 0,
+                    "output": run["stdout"] if run["stdout"] else "(Program exited successfully with code 0)",
+                    "error": run["stderr"],
                     "execution_type": "native_g++"
                 }
-            except subprocess.TimeoutExpired:
-                return {
-                    "success": False,
-                    "output": "",
-                    "error": "Execution timed out (infinite loop or process exceeded 4 seconds limit).",
-                    "execution_type": "native_g++"
-                }
-            except Exception as e:
-                # Fallback to simulated execution if error occurs
-                pass
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            # internal error: fall back to the simulated run below
 
         # 2. Built-in interpreter simulation (works anywhere even without g++)
         simulated_output = []
@@ -966,6 +943,55 @@ class CompilerAnalyzer:
             "execution_type": "fast_interpreter"
         }
 
+    def build_optimization(self) -> Tuple[str, List[str], Dict[str, Any]]:
+        """
+        Optimize the program, then prove it: compile and run the original and the optimized
+        version and only offer the result if both print exactly the same.
+        """
+        before = metrics(self.source)
+        report = {"status": "optimal", "verified": False, "message": "", "before": before, "after": before}
+        if any(d.level == "ERROR" for d in self.diagnostics) or self.compiles_clean is False:
+            report.update(status="needs_fixes",
+                          message="Fix the errors first (Fix All Errors), then run again to get the optimized code.")
+            return self.source, [], report
+        if any(d.level == "WARNING" and d.source == "compiler" for d in self.diagnostics):
+            report.update(status="needs_fixes",
+                          message="The compiler found likely bugs (see Diagnostics). Fix them first (Fix All Errors) - "
+                                  "optimizing a program that gives wrong answers would only make it faster at being wrong.")
+            return self.source, [], report
+        original = self.last_run or run_program(self.source, self.language, stdin="")
+        for aggressive in (True, False):
+            try:
+                code, events = optimize(self.source, self.language, aggressive)
+            except Exception as exc:  # never let the optimizer break analysis
+                print("optimizer error:", repr(exc))
+                break
+            if code == self.source:
+                report.update(message="This code is already optimal: nothing to simplify or remove.")
+                return self.source, [], report
+            after = metrics(code)
+            if original["status"] == "no_compiler":
+                report.update(status="unverified", after=after,
+                              message="Optimized. No compiler on the server, so the output could not be compared.")
+                return code, events, report
+            optimized = run_program(code, self.language, stdin="")
+            if optimized["status"] == "compile_error":
+                continue
+            if original["status"] == "ok" and optimized["status"] == "ok":
+                if optimized["stdout"] == original["stdout"] and optimized["returncode"] == original["returncode"]:
+                    report.update(status="optimized", verified=True, after=after,
+                                  message="Optimized. Both versions were compiled and run: the output is identical.")
+                    return code, events, report
+                continue
+            if original["status"] == "timeout" or optimized["status"] == "timeout":
+                report.update(status="unverified", after=after,
+                              message="Optimized and compiled, but the program runs too long (or waits for input) "
+                                      "to compare the outputs automatically.")
+                return code, events, report
+        report.update(status="not_safe",
+                      message="No optimization could be proven safe for this program, so the code is left as it is.")
+        return self.source, [], report
+
     def corrected_only(self) -> Tuple[str, List[str]]:
         """What Fix All / Apply Fix need: no program execution, no extra passes."""
         self.compiler_check()
@@ -980,6 +1006,7 @@ class CompilerAnalyzer:
 
         # Execute program
         execution_res = self.execute_code()
+        optimized_code, optimization_events, optimization_report = self.build_optimization()
 
         return {
             "tokens": [t.to_dict() for t in self.tokens],
@@ -988,7 +1015,9 @@ class CompilerAnalyzer:
                 for name, info in self.symbols.items()
             ],
             "diagnostics": [d.to_dict() for d in self.diagnostics],
-            "optimizations": self.optimizations,
+            "optimizations": optimization_events,
+            "optimized_code": optimized_code,
+            "optimization_report": optimization_report,
             "corrected_code": corrected_code,
             "fixes": fixes,
             "execution": execution_res,
@@ -997,7 +1026,7 @@ class CompilerAnalyzer:
                 "symbol_count": len(self.symbols),
                 "errors": errors,
                 "warnings": warnings,
-                "optimization_count": len(self.optimizations),
+                "optimization_count": len(optimization_events),
                 "status": "Analysis completed with diagnostics." if errors else "Analysis completed successfully."
             }
         }

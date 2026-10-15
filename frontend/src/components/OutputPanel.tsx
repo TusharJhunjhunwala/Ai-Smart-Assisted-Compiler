@@ -13,6 +13,9 @@ import {
   HelpCircle,
   Info,
   Terminal,
+  ShieldCheck,
+  ArrowRight,
+  AlertTriangle,
 } from 'lucide-react';
 
 interface OutputPanelProps {
@@ -21,6 +24,7 @@ interface OutputPanelProps {
   fixingLine?: number | null;
   onExplainDiag: (diag: DiagnosticItem) => void;
   onApplyCorrectedCode: (code: string) => void;
+  onApplyOptimizedCode?: (code: string) => void;
 }
 
 export const OutputPanel: React.FC<OutputPanelProps> = ({
@@ -29,16 +33,24 @@ export const OutputPanel: React.FC<OutputPanelProps> = ({
   fixingLine,
   onExplainDiag,
   onApplyCorrectedCode,
+  onApplyOptimizedCode,
 }) => {
   const [activeTab, setActiveTab] = useState<
     'output' | 'diagnostics' | 'tokens' | 'symbols' | 'optimizations' | 'corrected' | 'summary'
   >('output');
   const [copied, setCopied] = useState(false);
+  const [copiedOptimized, setCopiedOptimized] = useState(false);
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const copyOptimized = (text: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedOptimized(true);
+    setTimeout(() => setCopiedOptimized(false), 2000);
   };
 
   const errorCount = data?.summary.errors || 0;
@@ -359,30 +371,101 @@ export const OutputPanel: React.FC<OutputPanelProps> = ({
             )}
 
             {/* 4. Optimization Tab */}
-            {activeTab === 'optimizations' && (
-              <div className="space-y-2">
-                <div className="p-3 bg-slate-950/80 rounded-lg border border-slate-800 text-slate-400">
-                  <h4 className="font-semibold text-slate-200 mb-1">Early AST & Intermediate Optimization Passes:</h4>
-                  <p className="text-[11px]">
-                    Includes Constant Folding, Constant Propagation, Algebraic Simplification, Strength Reduction, and Common Subexpression Detection.
-                  </p>
+            {activeTab === 'optimizations' && (() => {
+              const report = data.optimization_report;
+              const optimized = data.optimized_code;
+              const hasResult = !!optimized && report && (report.status === 'optimized' || report.status === 'unverified');
+              const metric = (label: string, before: number, after: number) => (
+                <div className="px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 min-w-[110px]">
+                  <span className="text-slate-500 text-[10px] uppercase font-bold tracking-wider">{label}</span>
+                  <div className="flex items-center space-x-1.5 mt-0.5 font-mono">
+                    <span className="text-slate-400 text-sm">{before}</span>
+                    <ArrowRight className="w-3 h-3 text-slate-600" />
+                    <span className={`text-sm font-bold ${after < before ? 'text-emerald-400' : 'text-slate-200'}`}>{after}</span>
+                  </div>
                 </div>
-
-                {data.optimizations.length === 0 ? (
-                  <p className="text-slate-500 p-2">No optimization opportunities found in current code.</p>
-                ) : (
-                  data.optimizations.map((opt, i) => (
+              );
+              return (
+                <div className="space-y-3">
+                  {/* Status */}
+                  {report && (
                     <div
-                      key={i}
-                      className="p-2.5 rounded bg-amber-950/15 border border-amber-500/20 font-mono text-[11px] text-amber-200 flex items-start space-x-2"
+                      className={`p-3 rounded-lg border flex items-start space-x-2 ${
+                        report.status === 'optimized'
+                          ? 'bg-emerald-950/20 border-emerald-500/30 text-emerald-300'
+                          : report.status === 'optimal'
+                          ? 'bg-slate-950/80 border-slate-800 text-slate-300'
+                          : 'bg-amber-950/20 border-amber-500/30 text-amber-200'
+                      }`}
                     >
-                      <Zap className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
-                      <span>{opt}</span>
+                      {report.status === 'optimized' ? (
+                        <ShieldCheck className="w-4 h-4 shrink-0 mt-0.5" />
+                      ) : report.status === 'optimal' ? (
+                        <CheckCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                      ) : (
+                        <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                      )}
+                      <span className="text-[12px] leading-relaxed">{report.message}</span>
                     </div>
-                  ))
-                )}
-              </div>
-            )}
+                  )}
+
+                  {/* Before -> after */}
+                  {hasResult && report && (
+                    <div className="flex flex-wrap gap-2">
+                      {metric('Code lines', report.before.code_lines, report.after.code_lines)}
+                      {metric('Variables', report.before.variables, report.after.variables)}
+                      {metric('Arithmetic ops', report.before.operations, report.after.operations)}
+                    </div>
+                  )}
+
+                  {/* Optimized program */}
+                  {hasResult && (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <h4 className="font-semibold text-slate-200 text-[12px]">Optimized code</h4>
+                        <div className="flex items-center space-x-2">
+                          <button
+                            onClick={() => copyOptimized(optimized!)}
+                            className="flex items-center space-x-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition cursor-pointer"
+                          >
+                            {copiedOptimized ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                            <span>{copiedOptimized ? 'Copied' : 'Copy'}</span>
+                          </button>
+                          <button
+                            onClick={() => (onApplyOptimizedCode || onApplyCorrectedCode)(optimized!)}
+                            className="flex items-center space-x-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium transition cursor-pointer"
+                          >
+                            <Zap className="w-3 h-3" />
+                            <span>Replace Editor with Optimized Code</span>
+                          </button>
+                        </div>
+                      </div>
+                      <pre className="p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono text-[12px] text-emerald-300/90 whitespace-pre-wrap overflow-x-auto leading-relaxed">
+                        {optimized}
+                      </pre>
+                    </div>
+                  )}
+                  {/* What was optimized */}
+                  {data.optimizations.length > 0 && (
+                    <div className="space-y-1.5">
+                      <h4 className="font-semibold text-slate-200 text-[12px]">
+                        Optimizations applied ({data.optimizations.length})
+                      </h4>
+                      {data.optimizations.map((opt, i) => (
+                        <div
+                          key={i}
+                          className="p-2.5 rounded bg-amber-950/15 border border-amber-500/20 font-mono text-[11px] text-amber-200 flex items-start space-x-2"
+                        >
+                          <Zap className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                          <span>{opt}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                </div>
+              );
+            })()}
 
             {/* 5. Corrected Code Tab */}
             {activeTab === 'corrected' && (

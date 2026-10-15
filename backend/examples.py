@@ -173,45 +173,51 @@ int main() {
     {
         "id": "optimizer",
         "title": "5. Optimizer",
-        "description": "A correct program full of optimisation opportunities: constant folding and propagation, algebraic simplification, strength reduction, common subexpressions, dead code.",
+        "description": "A correct program full of waste. The optimizer rewrites it - folding, propagation, simplification, strength reduction, common subexpressions, copies, dead stores, dead branches and unreachable code - and proves the output is unchanged.",
         "language": "cpp",
-        "code": """// DEMO 5 - What an optimising compiler sees
-// This program is correct. Click Run / Analyze and open:
-//   Optimization - each optimisation found, with the line it applies to
-//   Diagnostics  - unused variables and overwritten values (dead code)
+        "code": """// DEMO 5 - The optimizer
+// Click Run / Analyze, then open the Optimization tab to see:
+//   - every optimization applied, line by line
+//   - the optimized program, which was compiled and run to prove it
+//     prints exactly the same output
+//   - "Replace Editor with Optimized Code" to use it
 
 #include <iostream>
 using namespace std;
 
 int twice(int value) {
-    int result = value * 2;         // strength reduction: * 2 -> value + value
-    int alias = result;             // copy propagation: alias is just result
-    return alias;
+    int result = value * 2;         // strength reduction: * 2 -> + (cheaper)
+    int copy = result;              // copy propagation: copy is just result
+    return copy;
+    cout << "never printed";        // unreachable: comes after return
+}
+
+int area(int width, int height) {
+    int inner = width * height + 4;
+    int outer = width * height + 4; // common subexpression: computed twice
+    return inner + outer;
 }
 
 int main() {
-    int seconds = 60 * 60 * 24;     // constant folding: computed at compile time
+    int seconds = 60 * 60 * 24;     // constant folding: done at compile time
     int days = 7;
-    int week = seconds * days;      // constant propagation: both values are known
+    int week = seconds * days;      // constant propagation: values are known
 
     int price = 250;
     int same = price * 1;           // algebraic simplification: * 1 does nothing
     int nothing = price * 0;        // algebraic simplification: always 0
-    int doubled = twice(price);
 
-    int a = 12;
-    int b = 30;
-    int first = a + b;
-    int second = a + b;             // common subexpression: a + b computed twice
+    bool debug = false;
+    if (debug) {                    // dead branch: debug is always false
+        cout << "Debug mode" << endl;
+    }
 
-    int copy = first;               // propagation: first is known to be 42
     int unused = 999;               // dead code: never used
-
     int discount = 10;
-    discount = 20;                  // the first value 10 is never read
+    discount = 20;                  // dead store: the 10 is never read
 
-    cout << week << " " << same << " " << nothing << " " << doubled << endl;
-    cout << second << " " << copy << " " << discount << endl;
+    cout << week << " " << same << " " << nothing << endl;
+    cout << twice(price) << " " << area(3, 4) << " " << discount << endl;
     return 0;
 }
 """

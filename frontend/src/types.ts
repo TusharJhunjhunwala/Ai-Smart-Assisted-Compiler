@@ -38,6 +38,20 @@ export interface ExecutionResult {
   execution_type: string;
 }
 
+export interface CodeMetrics {
+  code_lines: number;
+  variables: number;
+  operations: number;
+}
+
+export interface OptimizationReport {
+  status: 'optimized' | 'optimal' | 'needs_fixes' | 'unverified' | 'not_safe';
+  verified: boolean;
+  message: string;
+  before: CodeMetrics;
+  after: CodeMetrics;
+}
+
 export interface AnalysisResponse {
   tokens: TokenItem[];
   symbols: SymbolItem[];
@@ -45,6 +59,8 @@ export interface AnalysisResponse {
   optimizations: string[];
   corrected_code: string;
   fixes?: string[];
+  optimized_code?: string;
+  optimization_report?: OptimizationReport;
   execution?: ExecutionResult;
   summary: CompilationSummary;
 }

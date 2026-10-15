@@ -245,6 +245,11 @@ export const App: React.FC = () => {
               setCode(newCode);
               setStatusMessage('Editor updated with compiler-corrected code.');
             }}
+            onApplyOptimizedCode={(newCode) => {
+              setCode(newCode);
+              setStatusMessage('Editor updated with the optimized code. Re-checking...');
+              handleAnalyze(newCode);
+            }}
           />
         </div>
 
