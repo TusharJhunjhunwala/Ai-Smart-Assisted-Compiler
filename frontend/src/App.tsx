@@ -213,7 +213,11 @@ export const App: React.FC = () => {
         isAnalyzing={isAnalyzing}
         theme={theme}
         setTheme={setTheme}
-        hasErrors={errorCount > 0}
+        hasErrors={
+          errorCount > 0 ||
+          // compiler-detected bugs (warnings) are fixable too
+          (!!analysisData && analyzedSource === code && analysisData.corrected_code.trim() !== code.trim())
+        }
       />
 
       {/* Main Workspace */}
