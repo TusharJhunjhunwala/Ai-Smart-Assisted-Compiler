@@ -115,12 +115,10 @@ class AIService:
 
         # Case 2: #include completions
         if re.search(r"^\s*#include\s*<?\s*$", trimmed):
-            suggestions.append("<iostream>")
-            suggestions.append("<vector>")
-            suggestions.append("<string>")
-            suggestions.append("<cmath>")
-            suggestions.append("<algorithm>")
-            suggestions.append("<cstdio>")
+            opened = trimmed.endswith("<")  # the '<' is already typed
+            closer = ">" if not suffix.split("\n", 1)[0].lstrip().startswith(">") else ""
+            for header in ("iostream", "vector", "string", "cmath", "algorithm", "cstdio"):
+                suggestions.append(f"{header}{closer}" if opened else f"<{header}>")
             return suggestions
 
         # Case 3: "using namespace "
@@ -227,11 +225,12 @@ class AIService:
 
         # Case 11: cout <<
         if re.search(r"\bcout\s*<<\s*$", trimmed):
+            # only variables that really exist in the program
+            for name in var_names[:2]:
+                suggestions.append(f'"{name} = " << {name} << endl;')
             if var_names:
                 suggestions.append(f"{var_names[0]} << endl;")
-            suggestions.append('"Result: " << result << endl;')
             suggestions.append('"Hello, World!" << endl;')
-            suggestions.append('"Value: " << total << endl;')
             return suggestions
 
         # Case 12: cin >>
