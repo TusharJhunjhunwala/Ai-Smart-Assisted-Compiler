@@ -46,9 +46,6 @@ export const Navbar: React.FC<NavbarProps> = ({
           <span className="font-bold text-sm tracking-wide bg-gradient-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent">
             SmartCompiler
           </span>
-          <span className="ml-2 text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-            AI 2.0 Web
-          </span>
         </div>
       </div>
 
