@@ -270,9 +270,14 @@ class AIService:
             return suggestions
 
         # Case 15: Struct or Class definition
-        if re.search(r"^\s*(struct|class)\s+([A-Za-z_]\w*)\s*\{?$", trimmed):
-            brace = "{\n" if "{" not in trimmed else "\n"
-            suggestions.append(f"{brace}public:\n    int id;\n    string name;\n}};")
+        sm = re.search(r"^\s*(struct|class)\s+([A-Za-z_]\w*)\s*\{?$", trimmed)
+        if sm:
+            kind = sm.group(1)
+            brace = (" {\n" if not current_line.endswith(" ") else "{\n") if "{" not in trimmed else "\n"
+            access = "public:\n" if kind == "class" else ""
+            text_type = "string" if language == "cpp" else "char"
+            name_field = "    string name;" if language == "cpp" else "    char name[50];"
+            suggestions.append(self._balance_braces(f"{brace}{access}    int id;\n{name_field}\n}};", prefix, suffix))
             return suggestions
 
         # Case 16: Function call e.g. "add("
